@@ -308,6 +308,7 @@ pub fn firewall_present_in(s: &RuleState) -> bool {
         raw.is_some_and(|raw| {
             raw.has(&notrack_rule())
                 && cn6_bypassing_in(s) == raw.has(&cn6_return_rule())
+                && relay6_bypassing_in(s) == raw.has(&return_rule(RELAY6_SET))
                 && notrack_jumps().iter().all(|rule| raw.has(rule))
         })
     } else {
@@ -337,6 +338,7 @@ pub fn firewall_add() -> Result<(), String> {
 
 pub fn firewall_remove() {
     bypass_remove();
+    relay_remove();
     notrack_remove();
     for bin in ["iptables", "ip6tables"] {
         for rule in fw_rules() {
@@ -365,7 +367,8 @@ pub fn firewall_remove() {
 // untracked; the accepts above are stateless, so they still pass. Without the
 // TUN routing IPv6 these rules would leave WAN replies NEW for fw3 to reject,
 // so they exist only while sing-tun's IPv6 rules do. Mainland IPv6 that the
-// bypass sends past the TUN returns early and stays tracked and offloaded.
+// bypass sends past the TUN, and IPv6 to proxy servers sent past it (see
+// relay_add), return early and stay tracked and offloaded.
 
 const NOTRACK_CHAIN: &str = "mihomo_notrack";
 const GLOBAL_V6: &str = "2000::/3";
@@ -430,16 +433,35 @@ fn notrack_rule() -> Vec<&'static str> {
 }
 
 fn cn6_return_rule() -> Vec<&'static str> {
+    return_rule(CN6_SET)
+}
+
+/// The notrack chain's early return for destinations in `set`.
+fn return_rule(set: &'static str) -> Vec<&'static str> {
     vec![
         NOTRACK_CHAIN,
         "-m",
         "set",
         "--match-set",
-        CN6_SET,
+        set,
         "dst",
         "-j",
         "RETURN",
     ]
+}
+
+/// Insert (`on`) or remove the notrack chain's early return for `set`.
+fn sync_return(set: &'static str, on: bool) -> bool {
+    let rule = return_rule(set);
+    if on {
+        return raw6("-C", &rule) || raw6("-I", &rule);
+    }
+    for _ in 0..8 {
+        if !raw6("-D", &rule) {
+            break;
+        }
+    }
+    true
 }
 
 /// `ip6tables -t raw <op> <chain> [1] <rest>`; `-I` inserts at the top.
@@ -476,18 +498,14 @@ fn notrack_add() -> Result<(), String> {
             "ip6tables: could not create the {NOTRACK_CHAIN} chain"
         ));
     }
-    // While mainland IPv6 bypasses the TUN its early return must precede the
-    // notrack (rebuilt here after a flush); otherwise it must not be there.
-    if cn6_bypassing() {
-        if !raw6("-C", &cn6_return_rule()) && !raw6("-I", &cn6_return_rule()) {
-            return Err("ip6tables: could not insert the mainland IPv6 return".into());
-        }
-    } else {
-        for _ in 0..8 {
-            if !raw6("-D", &cn6_return_rule()) {
-                break;
-            }
-        }
+    // While mainland IPv6 or proxy servers' IPv6 bypass the TUN, their early
+    // returns must precede the notrack (rebuilt here after a flush);
+    // otherwise they must not be there.
+    if !sync_return(CN6_SET, cn6_bypassing()) {
+        return Err("ip6tables: could not insert the mainland IPv6 return".into());
+    }
+    if !sync_return(RELAY6_SET, relay6_bypassing()) {
+        return Err("ip6tables: could not insert the proxy servers' IPv6 return".into());
     }
     if !raw6("-C", &notrack_rule()) && !raw6("-A", &notrack_rule()) {
         return Err("ip6tables: could not add the IPv6 notrack rule".into());
@@ -579,6 +597,8 @@ struct Family {
     iptables: &'static str,
     ip: &'static str,
     set: &'static str,
+    /// Proxy servers' addresses of this family (relay_add).
+    relay: &'static str,
     inet: &'static str,
     prefixes: fn(&str) -> Vec<&str>,
 }
@@ -589,6 +609,7 @@ const FAMILIES: [Family; 2] = [
         iptables: "iptables",
         ip: "-4",
         set: CN_SET,
+        relay: RELAY_SET,
         inet: "inet",
         prefixes: cn_prefixes,
     },
@@ -597,6 +618,7 @@ const FAMILIES: [Family; 2] = [
         iptables: "ip6tables",
         ip: "-6",
         set: CN6_SET,
+        relay: RELAY6_SET,
         inet: "inet6",
         prefixes: cn6_prefixes,
     },
@@ -631,6 +653,11 @@ fn prefixes_of<A: std::str::FromStr>(text: &str, max_len: u8) -> Vec<&str> {
 
 /// `[chain, spec...]` of a family's mainland mark rule (mangle table).
 fn mark_rule(f: &Family) -> Vec<&'static str> {
+    set_mark_rule(f.set)
+}
+
+/// `[chain, spec...]` of the mark rule for LAN packets to `set`.
+fn set_mark_rule(set: &'static str) -> Vec<&'static str> {
     vec![
         "PREROUTING",
         "-i",
@@ -638,7 +665,7 @@ fn mark_rule(f: &Family) -> Vec<&'static str> {
         "-m",
         "set",
         "--match-set",
-        f.set,
+        set,
         "dst",
         "-m",
         "comment",
@@ -652,7 +679,10 @@ fn mark_rule(f: &Family) -> Vec<&'static str> {
 }
 
 fn bypass_mark_rule(f: &Family, op: &str) -> bool {
-    let rule = mark_rule(f);
+    mangle_rule(f, op, &mark_rule(f))
+}
+
+fn mangle_rule(f: &Family, op: &str, rule: &[&'static str]) -> bool {
     let mut args = vec!["-t", "mangle", op, rule[0]];
     if op == "-I" {
         args.push("1");
@@ -684,6 +714,16 @@ fn set_present(set: &str) -> bool {
 /// Mainland IPv6 is being sent past the TUN, so it must skip the notrack.
 fn cn6_bypassing() -> bool {
     bypass_mark_rule(V6, "-C")
+}
+
+/// Proxy servers' IPv6 is being sent past the TUN.
+fn relay6_bypassing() -> bool {
+    mangle_rule(V6, "-C", &set_mark_rule(RELAY6_SET))
+}
+
+fn relay6_bypassing_in(s: &RuleState) -> bool {
+    s.mangle(V6.iptables)
+        .is_some_and(|l| l.has(&set_mark_rule(RELAY6_SET)))
 }
 
 fn cn6_bypassing_in(s: &RuleState) -> bool {
@@ -955,31 +995,53 @@ pub fn bypass_add() -> Result<usize, String> {
                 f.iptables
             ));
         }
-        if !bypass_rule_present(f) {
-            let ok = Command::new("ip")
-                .args([
-                    f.ip,
-                    "rule",
-                    "add",
-                    "pref",
-                    BYPASS_PREF,
-                    "fwmark",
-                    BYPASS_MARK,
-                    "lookup",
-                    "main",
-                ])
-                .bounded_output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-            if !ok {
-                return Err(format!(
-                    "ip rule: could not add the {} mainland bypass rule",
-                    f.name
-                ));
-            }
+        if !bypass_route_add(f) {
+            return Err(format!(
+                "ip rule: could not add the {} mainland bypass rule",
+                f.name
+            ));
         }
     }
     Ok(loaded)
+}
+
+/// The ip rule that sends marked packets through the main table; shared by
+/// the mainland bypass and the proxy servers'.
+fn bypass_route_add(f: &Family) -> bool {
+    bypass_rule_present(f)
+        || Command::new("ip")
+            .args([
+                f.ip,
+                "rule",
+                "add",
+                "pref",
+                BYPASS_PREF,
+                "fwmark",
+                BYPASS_MARK,
+                "lookup",
+                "main",
+            ])
+            .bounded_output()
+            .map(|o| o.status.success())
+            .unwrap_or(false)
+}
+
+/// Remove that ip rule unless the mark rule for `other` (the other user of
+/// it) is still in place.
+fn bypass_route_drop_unless(f: &Family, other: &'static str) {
+    if mangle_rule(f, "-C", &set_mark_rule(other)) {
+        return;
+    }
+    for _ in 0..8 {
+        let ok = Command::new("ip")
+            .args([f.ip, "rule", "del", "pref", BYPASS_PREF])
+            .bounded_output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok {
+            break;
+        }
+    }
 }
 
 /// Marks and ip rules go first, so mainland IPv6 is back in the TUN before
@@ -991,16 +1053,7 @@ pub fn bypass_remove() {
                 break;
             }
         }
-        for _ in 0..8 {
-            let ok = Command::new("ip")
-                .args([f.ip, "rule", "del", "pref", BYPASS_PREF])
-                .bounded_output()
-                .map(|o| o.status.success())
-                .unwrap_or(false);
-            if !ok {
-                break;
-            }
-        }
+        bypass_route_drop_unless(f, f.relay);
     }
     for _ in 0..8 {
         if !raw6("-D", &cn6_return_rule()) {
@@ -1011,6 +1064,102 @@ pub fn bypass_remove() {
     for f in &FAMILIES {
         let _ = Command::new("ipset")
             .args(["destroy", f.set])
+            .bounded_output();
+    }
+}
+
+// ── Proxy servers past the TUN ───────────────────────────────────────────────
+//
+// LAN packets to the active config's proxy servers (relay.rs picks them) get
+// the mainland bypass's mark from their own ipsets, so the same ip rule sends
+// them through the main table: kernel NAT, IPA offload, and a connection the
+// client itself sees fail, so its own IPv4-to-IPv6 fallback works. Their
+// IPv6 returns before the notrack and stays tracked. Same order as the
+// mainland bypass: sets, then the return, then marks and the ip rule.
+
+const RELAY_SET: &str = "mihomo-relay";
+const RELAY6_SET: &str = "mihomo-relay6";
+
+/// Make the proxy servers' sets hold exactly `addrs` and put the rules in
+/// place. Both families' sets and rules exist even if one is empty.
+pub fn relay_add(addrs: &[std::net::IpAddr]) -> Result<(), String> {
+    let mut script = String::new();
+    for f in &FAMILIES {
+        let set = f.relay;
+        script.push_str(&format!(
+            "create {set} hash:net family {} -exist\nflush {set}\n",
+            f.inet
+        ));
+        for a in addrs.iter().filter(|a| a.is_ipv6() == (f.inet == "inet6")) {
+            script.push_str(&format!("add {set} {a} -exist\n"));
+        }
+    }
+    let out = process_runner::output(
+        Command::new("ipset").arg("restore"),
+        Some(script.as_bytes()),
+        Duration::from_secs(10),
+        64 * 1024,
+    )
+    .map_err(|e| format!("ipset restore: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "ipset restore: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    if notrack_chain_exists() && !sync_return(RELAY6_SET, true) {
+        return Err("ip6tables: could not insert the proxy servers' IPv6 return".into());
+    }
+    for f in &FAMILIES {
+        let rule = set_mark_rule(f.relay);
+        if !mangle_rule(f, "-C", &rule) && !mangle_rule(f, "-I", &rule) {
+            return Err(format!(
+                "{}: could not insert the proxy servers' mark rule",
+                f.iptables
+            ));
+        }
+        if !bypass_route_add(f) {
+            return Err(format!("ip rule: could not add the {} bypass rule", f.name));
+        }
+    }
+    Ok(())
+}
+
+/// Everything [`relay_add`] puts in place, against one read of the rule state
+/// (set contents are not compared).
+pub fn relay_present_in(s: &RuleState) -> bool {
+    FAMILIES.iter().all(|f| {
+        s.sets()
+            .is_some_and(|sets| sets.iter().any(|n| n == f.relay))
+            && s.mangle(f.iptables)
+                .is_some_and(|l| l.has(&set_mark_rule(f.relay)))
+            && has_pref(s.ip_rules(f.ip), BYPASS_PREF)
+    }) && s
+        .raw6()
+        .is_none_or(|raw| !raw.has_chain(NOTRACK_CHAIN) || raw.has(&return_rule(RELAY6_SET)))
+}
+
+/// Either set exists (an earlier agent may have left the rules).
+pub fn relay_in_place() -> bool {
+    set_present(RELAY_SET) || set_present(RELAY6_SET)
+}
+
+/// Marks first, then the ip rule unless the mainland bypass still uses it,
+/// then the IPv6 return, then the sets.
+pub fn relay_remove() {
+    for f in &FAMILIES {
+        let rule = set_mark_rule(f.relay);
+        for _ in 0..8 {
+            if !mangle_rule(f, "-D", &rule) {
+                break;
+            }
+        }
+        bypass_route_drop_unless(f, f.set);
+    }
+    sync_return(RELAY6_SET, false);
+    for f in &FAMILIES {
+        let _ = Command::new("ipset")
+            .args(["destroy", f.relay])
             .bounded_output();
     }
 }

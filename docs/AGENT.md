@@ -188,6 +188,24 @@ release, GitHub SHA-256 verified on both ends).
   offload (measured 138–195 Mbit/s at ~0% mihomo CPU). Mainland IPv6 also
   returns early from the IPv6 notrack chain (below), so it stays tracked.
   Runtime only, re-asserted with the accepts, removed with them.
+- **Proxy servers past the TUN** (always on with the TUN; `relay.rs`): LAN
+  clients that run their own proxy client against the same servers reach
+  them as plain forwarded traffic. Through the TUN such a connection was
+  accepted by mihomo's stack and dialled again from the router, so it cost
+  mihomo CPU, got no IPA offload, and the client never saw the server's IPv4
+  address fail, so its own IPv4-to-IPv6 fallback could not work. Every 10
+  minutes, and on the tick after the config file changes, the agent takes the
+  `server` of every proxy in the live config and its proxy providers' files,
+  resolves names through mihomo (`/dns/query`, the resolver LAN clients use),
+  and keeps the global unicast addresses whose first matching
+  `IP-CIDR`/`IP-CIDR6` rule (inline, or inside a text or YAML rule set)
+  targets `DIRECT`. An address shared with other sites (a node behind a CDN)
+  is not listed like that, so it stays in the TUN; rules the agent cannot
+  evaluate for an address (`GEOIP`, `IP-ASN`, `mrs` sets) are skipped. The
+  addresses go into `mihomo-relay`/`mihomo-relay6`, which get the mainland
+  bypass's mark and share its ip rule 8999 (removed only when neither uses
+  it); their IPv6 returns before the notrack. A lookup the controller fails
+  keeps the earlier addresses and is retried after 30 s.
 - **IPv6 and IPA offload**: ipacm offloads established IPv6 flows by their
   conntrack tuple (`IPv6CTEnabled` in `/etc/data/ipa/IPACM_cfg.xml`). A LAN
   flow routed into the TUN looks forwarded, so about 250 ms in the client's

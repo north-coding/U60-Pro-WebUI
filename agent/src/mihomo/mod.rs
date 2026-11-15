@@ -16,6 +16,7 @@
 mod config;
 mod controller;
 mod profile;
+mod relay;
 mod service;
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -54,6 +55,11 @@ const PROBE_FAILURES: u32 = 3;
 /// minimum gap between such re-tests (all nodes may simply be down).
 const ROUTE_FAILURES: u32 = 2;
 const RETEST_EVERY: Duration = Duration::from_secs(300);
+/// How often the proxy servers sent past the TUN are looked up again (their
+/// names can move), and the retry gap after a lookup the controller failed.
+/// A changed config file is checked on the next tick.
+const RELAY_EVERY: Duration = Duration::from_secs(600);
+const RELAY_RETRY: Duration = Duration::from_secs(30);
 const AUTO_GROUP_TYPES: &[&str] = &["URLTest", "Fallback", "LoadBalance"];
 const GROUP_TYPES: &[&str] = &["Selector", "URLTest", "Fallback", "LoadBalance", "Relay"];
 
@@ -82,6 +88,13 @@ struct Inner {
     dns_failures: u8,
     /// The live config's controller secret, cached by file modification time.
     panel_secret: Option<(std::time::SystemTime, String)>,
+    /// Proxy server addresses sent past the TUN (relay.rs), and when and
+    /// against which config file they were last looked up.
+    relay: Vec<std::net::IpAddr>,
+    relay_checked: Option<Instant>,
+    relay_config: Option<std::time::SystemTime>,
+    /// The last lookup was incomplete: retry soon, keep older addresses.
+    relay_incomplete: bool,
 }
 
 /// Is mihomo still forwarding? (A live process can hang with the TUN up,
@@ -245,6 +258,10 @@ impl Manager {
                 panel_secret: None,
                 profile_attempt: None,
                 health: Health::default(),
+                relay: Vec::new(),
+                relay_checked: None,
+                relay_config: None,
+                relay_incomplete: false,
             }),
         }
     }
@@ -288,6 +305,12 @@ impl Manager {
                             retest_auto_groups();
                         }
                     }
+                }
+                // Lookups go through the controller: not under the lock.
+                let relay_due = me.lock().relay_due();
+                if let Some(config) = relay_due {
+                    let found = relay::find(&config, Path::new(service::DIR));
+                    me.lock().relay_result(found);
                 }
                 let profile_due = me.lock().profile_due();
                 if let Some(sub) = profile_due {
@@ -631,6 +654,7 @@ impl Inner {
                 rules = service::RuleState::new();
             }
             self.sync_bypass(&rules);
+            self.sync_relay(&rules);
             self.sync_dns();
         } else if !(self.state.settings.tun && self.alive()) {
             // Idempotent: also keeps dnsmasq on the carrier's current resolvers.
@@ -696,6 +720,89 @@ impl Inner {
                 eprintln!("[mihomo] mainland bypass off");
             }
             self.bypass_active = false;
+        }
+    }
+
+    /// The live config when the proxy servers sent past the TUN are due to be
+    /// looked up again: TUN running and RELAY_EVERY passed (RELAY_RETRY after
+    /// an incomplete lookup), or the config file changed.
+    fn relay_due(&mut self) -> Option<Value> {
+        if !(self.state.settings.tun && self.alive()) {
+            return None;
+        }
+        let modified = fs::metadata(service::CONFIG)
+            .and_then(|m| m.modified())
+            .ok();
+        let every = if self.relay_incomplete {
+            RELAY_RETRY
+        } else {
+            RELAY_EVERY
+        };
+        let due = modified != self.relay_config
+            || self.relay_checked.is_none_or(|t| t.elapsed() >= every);
+        if !due {
+            return None;
+        }
+        self.relay_checked = Some(Instant::now());
+        self.relay_config = modified;
+        fs::read(service::CONFIG)
+            .ok()
+            .and_then(|b| serde_json::from_slice(&b).ok())
+    }
+
+    /// Bring the proxy servers' bypass in line with a lookup. An incomplete
+    /// lookup keeps the addresses it could not confirm.
+    fn relay_result(&mut self, found: relay::Found) {
+        if !(self.state.settings.tun && self.alive()) {
+            return;
+        }
+        self.relay_incomplete = !found.complete;
+        let mut want = found.addresses;
+        if !found.complete {
+            want.extend(self.relay.iter().copied());
+        }
+        want.sort_unstable();
+        want.dedup();
+        if want.is_empty() {
+            if !self.relay.is_empty() || service::relay_in_place() {
+                service::relay_remove();
+                eprintln!("[mihomo] no proxy server sent past the TUN");
+            }
+            self.relay.clear();
+            return;
+        }
+        if want == self.relay && service::relay_present_in(&service::RuleState::new()) {
+            return;
+        }
+        match service::relay_add(&want) {
+            Ok(()) => {
+                eprintln!(
+                    "[mihomo] {} proxy server address(es) sent past the TUN",
+                    want.len()
+                );
+                self.relay = want;
+            }
+            Err(e) => {
+                eprintln!("[mihomo] sending proxy servers past the TUN failed: {e}");
+                self.last_error = Some(format!("proxy servers past the TUN: {e}"));
+                service::relay_remove();
+                self.relay.clear();
+            }
+        }
+    }
+
+    /// Put the proxy servers' bypass back after something (fw3, a stop)
+    /// removed its rules.
+    fn sync_relay(&mut self, rules: &service::RuleState) {
+        if self.relay.is_empty() || service::relay_present_in(rules) {
+            return;
+        }
+        match service::relay_add(&self.relay) {
+            Ok(()) => eprintln!("[mihomo] proxy servers' bypass rules restored"),
+            Err(e) => {
+                eprintln!("[mihomo] restoring the proxy servers' bypass failed: {e}");
+                self.last_error = Some(format!("proxy servers past the TUN: {e}"));
+            }
         }
     }
 
@@ -766,6 +873,8 @@ impl Inner {
             self.firewall_checked = None;
         }
         self.sync_bypass(&service::RuleState::new());
+        // A new process: look the proxy servers up again on the next tick.
+        self.relay_checked = None;
         if self.version.is_none() {
             self.version = service::version();
         }
@@ -1748,6 +1857,10 @@ mod tests {
                     panel_secret: None,
                     profile_attempt: None,
                     health: Health::default(),
+                    relay: Vec::new(),
+                    relay_checked: None,
+                    relay_config: None,
+                    relay_incomplete: false,
                 }),
             }
         }
