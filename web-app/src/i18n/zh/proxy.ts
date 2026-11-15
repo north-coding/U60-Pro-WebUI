@@ -175,6 +175,8 @@ export const proxy: Record<string, string> = {
   'Every 3 days': '每 3 天',
   Weekly: '每周',
   'Every {n} h': '每 {n} 小时',
+  'Checked every 10 min': '每 10 分钟检查',
+  'Its config is also checked every 10 minutes and applied as soon as it changes.': '还会每 10 分钟检查一次订阅配置，有变化立即生效。',
   Unknown: '未知',
   'Not installed': '未安装',
   Running: '运行中',

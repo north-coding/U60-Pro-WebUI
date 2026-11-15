@@ -43,8 +43,10 @@ const BACKOFF_MAX: Duration = Duration::from_secs(300);
 /// A process that exits sooner than this after starting counts as a failed
 /// start, so it is retried with backoff instead of on the next tick.
 const STABLE_RUN: Duration = Duration::from_secs(60);
-/// Minimum gap between automatic profile downloads after a failure.
-const PROFILE_RETRY: Duration = Duration::from_secs(1800);
+/// How often an auto-updating profile subscription is downloaded to look for
+/// changes (also the retry gap after a failure). A changed config is applied
+/// at once; an unchanged one costs one download and no reload.
+const PROFILE_CHECK_EVERY: Duration = Duration::from_secs(600);
 /// Forwarding health check: interval and consecutive failures before acting.
 const PROBE_EVERY: Duration = Duration::from_secs(60);
 const PROBE_FAILURES: u32 = 3;
@@ -182,6 +184,12 @@ fn save_state(state: &State) -> Result<(), String> {
         .map_err(|e| format!("cannot save {STATE_FILE}: {e}"))
 }
 
+/// Whether `interval_hours` (0 = manual only: never) has passed between the
+/// epoch seconds `since` and `now`.
+fn interval_elapsed(since: u64, interval_hours: u32, now: u64) -> bool {
+    interval_hours > 0 && since.saturating_add(u64::from(interval_hours) * 3600) <= now
+}
+
 /// Unix seconds → `YYYY-MM-DDTHH:MM:SSZ` (civil-from-days, no date crate).
 fn iso8601(secs: u64) -> String {
     let days = (secs / 86_400) as i64;
@@ -283,8 +291,13 @@ impl Manager {
                 }
                 let profile_due = me.lock().profile_due();
                 if let Some(sub) = profile_due {
-                    if let Err(e) = me.refresh_profile(&sub) {
-                        eprintln!("[mihomo] scheduled profile update failed: {e}");
+                    let last_error = me.lock().sub_errors.get(&sub.id).cloned();
+                    match me.refresh_profile(&sub, false) {
+                        Ok(true) => eprintln!("[mihomo] subscription config changed; reloaded"),
+                        Ok(false) => {}
+                        // A 10-minute check would repeat an outage's error all day.
+                        Err(e) if last_error.as_ref() == Some(&e) => {}
+                        Err(e) => eprintln!("[mihomo] scheduled profile update failed: {e}"),
                     }
                 }
                 ticks += 1;
@@ -297,9 +310,13 @@ impl Manager {
     }
 
     /// Download `sub` (without holding the lock) and, if it is still the
-    /// same subscription, store the result and re-apply the config.
-    fn refresh_profile(&self, sub: &Subscription) -> Result<(), String> {
-        let fetched = profile::fetch(sub);
+    /// same subscription, install and hot-reload a changed config. An
+    /// unchanged one leaves mihomo alone; its usage and fetch time are stored
+    /// when `record` is set (a manual update) or the subscription's interval
+    /// has passed, so the 10-minute checks don't rewrite the state file.
+    /// Returns whether the config changed.
+    fn refresh_profile(&self, sub: &Subscription, record: bool) -> Result<bool, String> {
+        let fetched = profile::fetch_checked(sub);
         let mut inner = self.lock();
         let Some(idx) = inner
             .find_sub(&sub.id)
@@ -307,7 +324,7 @@ impl Manager {
         else {
             return Err("the subscription changed while it was downloading".into());
         };
-        let fetched = match fetched {
+        let (fetched, changed) = match fetched {
             Ok(f) => f,
             Err(e) => {
                 inner.sub_errors.insert(sub.id.clone(), e.clone());
@@ -315,13 +332,23 @@ impl Manager {
             }
         };
         let mut next = inner.state.clone();
+        if !changed {
+            inner.sub_errors.remove(&sub.id);
+            let stored_at = next.subscriptions[idx].fetched.as_ref().map_or(0, |f| f.at);
+            if record || interval_elapsed(stored_at, sub.interval_hours, fetched.at) {
+                next.subscriptions[idx].fetched = Some(fetched);
+                save_state(&next)?;
+                inner.state = next;
+            }
+            return Ok(false);
+        }
         next.subscriptions[idx].fetched = Some(fetched);
         let result = inner.apply(next);
         match &result {
             Ok(()) => inner.sub_errors.remove(&sub.id),
             Err(e) => inner.sub_errors.insert(sub.id.clone(), e.clone()),
         };
-        result
+        result.map(|()| true)
     }
 }
 
@@ -510,19 +537,17 @@ impl Inner {
         true
     }
 
-    /// The profile subscription when its auto-update interval has elapsed.
+    /// The profile subscription when its next change check is due: every
+    /// PROFILE_CHECK_EVERY while auto-update is on (interval > 0). The first
+    /// check runs one period after the agent starts, once the WAN and the
+    /// clock have settled after a boot.
     fn profile_due(&mut self) -> Option<Subscription> {
         let sub = self.profile_sub()?.clone();
         if sub.interval_hours == 0 || !self.state.settings.enabled {
             return None;
         }
-        let last = sub.fetched.as_ref().map_or(0, |f| f.at);
-        let due = last + u64::from(sub.interval_hours) * 3600 <= profile::now_secs();
-        if !due
-            || self
-                .profile_attempt
-                .is_some_and(|t| t.elapsed() < PROFILE_RETRY)
-        {
+        let last = *self.profile_attempt.get_or_insert_with(Instant::now);
+        if last.elapsed() < PROFILE_CHECK_EVERY {
             return None;
         }
         self.profile_attempt = Some(Instant::now());
@@ -1485,7 +1510,7 @@ impl Manager {
         let mut results = serde_json::Map::new();
         for sub in &targets {
             let outcome = if profile_id.as_deref() == Some(sub.id.as_str()) {
-                self.refresh_profile(sub)
+                self.refresh_profile(sub, true).map(|_| ())
             } else if !sub.enabled {
                 Err("subscription is disabled".into())
             } else if profile_id.is_some() {
@@ -1737,6 +1762,42 @@ mod tests {
             "JP 01": {"type": "Trojan", "history": []},
             "DIRECT": {"type": "Direct"},
         })
+    }
+
+    #[test]
+    fn profile_is_checked_every_ten_minutes_only_when_auto_updating() {
+        let m = Manager::new_for_tests();
+        let mut inner = m.lock();
+        inner.state.settings.enabled = true;
+        inner.state.settings.profile = Some("1a2b3c4d".into());
+        inner.state.subscriptions.push(Subscription {
+            id: "1a2b3c4d".into(),
+            name: "sub".into(),
+            url: "https://example.com/sub".into(),
+            enabled: true,
+            interval_hours: 24,
+            fetched: None,
+        });
+        // The first check waits one period after the agent starts.
+        assert!(inner.profile_due().is_none());
+        let Some(earlier) = Instant::now().checked_sub(PROFILE_CHECK_EVERY) else {
+            return; // the test host booted less than ten minutes ago
+        };
+        inner.profile_attempt = Some(earlier);
+        assert!(inner.profile_due().is_some());
+        assert!(inner.profile_due().is_none());
+        inner.profile_attempt = Some(earlier);
+        inner.state.subscriptions[0].interval_hours = 0;
+        assert!(inner.profile_due().is_none());
+    }
+
+    #[test]
+    fn stored_usage_waits_for_the_interval() {
+        assert!(!interval_elapsed(1_000, 24, 1_000 + 86_399));
+        assert!(interval_elapsed(1_000, 24, 1_000 + 86_400));
+        assert!(!interval_elapsed(0, 0, u64::MAX));
+        // A clock stepped back (8 h fast just after boot) is not "elapsed".
+        assert!(!interval_elapsed(1_000 + 28_800, 6, 1_000));
     }
 
     #[test]

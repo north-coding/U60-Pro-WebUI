@@ -109,6 +109,16 @@ release, GitHub SHA-256 verified on both ends).
   `mihomo -t`, atomically renamed into `config.yaml`, then hot-reloaded via the
   controller. A failed reload restores the previous file and state.
   Subscriptions are fetched `DIRECT` so they never depend on their own nodes.
+- **Subscription checks**: while auto-update is on (`interval_hours` > 0), the
+  subscription whose config is in use is downloaded every 10 minutes (the
+  first time 10 minutes after the agent starts). The download is compared
+  with the cached profile after parsing, since providers put the traffic used
+  into a header comment. A changed config is installed and hot-reloaded at
+  once; an unchanged one leaves mihomo alone, and its usage and fetch time
+  are stored only once `interval_hours` has passed (or on a manual update), so
+  the checks don't rewrite `manager.json`. A failing check is retried on the
+  next one and logged only when its error changes. Node-source subscriptions
+  are still refreshed by mihomo every `interval_hours`.
 - **Clock**: the firmware's NITZ sync writes local time into the system clock
   labelled as UTC (8 h ahead of real UTC in China). The agent never touches it;
   `scripts/device/net-time-guard.sh` steps it back to UTC after boot. Every
@@ -156,16 +166,6 @@ release, GitHub SHA-256 verified on both ends).
   address, and since the WAN often gets its /64 minutes after boot, the TUN
   came up IPv4-only and LAN IPv6 bypassed the proxy until the next reload
   (2026-11-15).
-- **Mainland bypass** (`settings.cn_bypass`, default on): TUN costs about one
-  A55 core per 100 Mbit/s (measured 2026-10-06: ~90 Mbit/s domestic at 80–90%
-  of a core). With the bypass, LAN packets to mainland IPv4 and IPv6 ranges
-  (ipsets `mihomo-cn` and `mihomo-cn6`, loaded from `/data/mihomo/cn.list`,
-  which `deploy-mihomo.sh` installs from a pinned MetaCubeX commit; a family
-  with under 1000 prefixes is refused as truncated) get mark `0x10000000` in
-  mangle PREROUTING, and ip rule 8999 (one per family) sends them through the
-  main table ahead of sing-tun's rules, so they keep the stock path and IPA
-  offload (measured 138–195 Mbit/s at ~0% mihomo CPU). Mainland IPv6 also
-  returns early from the IPv6 notrack chain (below), so it stays tracked.
 - **LAN DNS**: while the TUN runs and mihomo's resolver (`127.0.0.1:1053`,
   `redir-host`, so LAN clients get real addresses) answers, dnsmasq forwards
   every name to it. The switch is `/tmp/mihomo-dns.servers`, named by
@@ -177,6 +177,16 @@ release, GitHub SHA-256 verified on both ends).
   once and served the faster answer, so poisoned replies reached the LAN
   (2026-11-15). Two failed checks hand DNS back to the carrier; each mihomo
   reload flushes dnsmasq's cache.
+- **Mainland bypass** (`settings.cn_bypass`, default on): TUN costs about one
+  A55 core per 100 Mbit/s (measured 2026-10-06: ~90 Mbit/s domestic at 80–90%
+  of a core). With the bypass, LAN packets to mainland IPv4 and IPv6 ranges
+  (ipsets `mihomo-cn` and `mihomo-cn6`, loaded from `/data/mihomo/cn.list`,
+  which `deploy-mihomo.sh` installs from a pinned MetaCubeX commit; a family
+  with under 1000 prefixes is refused as truncated) get mark `0x10000000` in
+  mangle PREROUTING, and ip rule 8999 (one per family) sends them through the
+  main table ahead of sing-tun's rules, so they keep the stock path and IPA
+  offload (measured 138–195 Mbit/s at ~0% mihomo CPU). Mainland IPv6 also
+  returns early from the IPv6 notrack chain (below), so it stays tracked.
   Runtime only, re-asserted with the accepts, removed with them.
 - **IPv6 and IPA offload**: ipacm offloads established IPv6 flows by their
   conntrack tuple (`IPv6CTEnabled` in `/etc/data/ipa/IPACM_cfg.xml`). A LAN

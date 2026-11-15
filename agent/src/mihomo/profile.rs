@@ -34,6 +34,14 @@ pub fn now_secs() -> u64 {
 /// cached profile. The URL (it carries the account token) never appears in
 /// errors or logs.
 pub fn fetch(sub: &Subscription) -> Result<Fetched, String> {
+    fetch_checked(sub).map(|(fetched, _)| fetched)
+}
+
+/// [`fetch`], also reporting whether the config differs from the cached
+/// profile. An unchanged download leaves the cached file alone. Configs are
+/// compared parsed, not byte for byte: providers put the traffic used into a
+/// header comment, so the raw text changes on every download.
+pub fn fetch_checked(sub: &Subscription) -> Result<(Fetched, bool), String> {
     fs::create_dir_all(DIR).map_err(|e| format!("cannot create {DIR}: {e}"))?;
     let _ = fs::set_permissions(DIR, fs::Permissions::from_mode(0o700));
     let target = path(&sub.id);
@@ -93,15 +101,21 @@ pub fn fetch(sub: &Subscription) -> Result<Fetched, String> {
         let _ = fs::remove_file(&part);
         return Err("the subscription did not return a Clash/mihomo config".into());
     }
-    fs::rename(&part, &target).map_err(|e| format!("cannot save the profile: {e}"))?;
-    let _ = fs::set_permissions(&target, fs::Permissions::from_mode(0o600));
-    Ok(Fetched {
+    let changed = load(&sub.id).map_or(true, |cached| cached != config);
+    if changed {
+        fs::rename(&part, &target).map_err(|e| format!("cannot save the profile: {e}"))?;
+        let _ = fs::set_permissions(&target, fs::Permissions::from_mode(0o600));
+    } else {
+        let _ = fs::remove_file(&part);
+    }
+    let fetched = Fetched {
         at: now_secs(),
         full,
         proxies,
         groups,
         usage: parse_userinfo(&header_text),
-    })
+    };
+    Ok((fetched, changed))
 }
 
 pub fn load(id: &str) -> Result<Value, String> {
@@ -179,5 +193,14 @@ mod tests {
         assert_eq!(v["proxy-groups"][0]["name"], "节点选择");
         assert!(parse_yaml(b"- just\n- a list\n").is_err());
         assert!(parse_yaml(b"key: [unclosed").is_err());
+    }
+
+    #[test]
+    fn header_comments_do_not_count_as_a_change() {
+        let a = parse_yaml(b"# Traffic: 1.00 GiB\nproxies: [{name: a, type: ss}]\n").unwrap();
+        let b = parse_yaml(b"# Traffic: 1.01 GiB\nproxies: [{name: a, type: ss}]\n").unwrap();
+        assert_eq!(a, b);
+        let c = parse_yaml(b"proxies: [{name: a, type: vless}]\n").unwrap();
+        assert_ne!(a, c);
     }
 }

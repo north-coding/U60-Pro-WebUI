@@ -173,7 +173,9 @@ function SubscriptionRow({
             {!sub.use_config && profileActive && sub.enabled && <Chip>{t('Not in use')}</Chip>}
             {sub.node_count !== undefined && <Chip tone="accent">{t('{n} nodes', { n: sub.node_count })}</Chip>}
             {sub.groups !== undefined && <Chip>{t('{n} groups', { n: sub.groups })}</Chip>}
-            <Chip>{intervalLabel(sub.interval_hours)}</Chip>
+            <Chip>
+              {sub.use_config && sub.interval_hours > 0 ? t('Checked every 10 min') : intervalLabel(sub.interval_hours)}
+            </Chip>
           </div>
           <p className="mt-0.5 break-all font-mono text-caption text-ink3">{sub.url_masked}</p>
         </div>
@@ -284,7 +286,14 @@ function EditSubscription({ sub, onDone }: { sub: ProxySubscription; onDone: () 
       <Field label={t('Name')} error={errors.name}>
         <Input value={name} maxLength={32} onChange={(e) => setName(e.target.value)} />
       </Field>
-      <Field label={t('Update interval')}>
+      <Field
+        label={t('Update interval')}
+        hint={
+          sub.use_config && intervalHours > 0
+            ? t('Its config is also checked every 10 minutes and applied as soon as it changes.')
+            : undefined
+        }
+      >
         <Select value={intervalHours} onChange={(e) => setIntervalHours(Number(e.target.value))}>
           {INTERVAL_OPTIONS.map((o) => (
             <option key={o.value} value={o.value}>
