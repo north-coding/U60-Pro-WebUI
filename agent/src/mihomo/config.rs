@@ -73,10 +73,20 @@ pub struct Settings {
     /// With TUN: send LAN traffic to mainland IPv4 ranges around the TUN
     /// (stock path, hardware offload) instead of through mihomo.
     pub cn_bypass: bool,
+    /// With TUN: send LAN traffic to every proxy server of the active config
+    /// past the TUN (relay.rs); off: only servers the rules send DIRECT by IP.
+    /// Written only when off, so an older agent (deny_unknown_fields) still
+    /// reads a state file that leaves it at the default.
+    #[serde(skip_serializing_if = "is_true")]
+    pub node_bypass: bool,
     pub mixed_port: u16,
     /// Subscription whose own full config (groups, rules, rule sets) is used.
     /// `None`: the managed config (subscriptions as node providers + `preset`).
     pub profile: Option<String>,
+}
+
+fn is_true(b: &bool) -> bool {
+    *b
 }
 
 impl Default for Settings {
@@ -87,6 +97,7 @@ impl Default for Settings {
             preset: Preset::BypassCn,
             tun: false,
             cn_bypass: true,
+            node_bypass: true,
             mixed_port: DEFAULT_PORT,
             profile: None,
         }
@@ -535,6 +546,24 @@ fn node_server_names(obj: &Map<String, Value>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn node_bypass_defaults_on_and_is_written_only_when_off() {
+        let on = Settings::default();
+        assert!(on.node_bypass);
+        let text = serde_json::to_string(&on).unwrap();
+        assert!(!text.contains("node_bypass"), "{text}");
+        // A state file from before the setting existed.
+        let old: Settings = serde_json::from_str(r#"{"enabled": true, "tun": true}"#).unwrap();
+        assert!(old.node_bypass);
+        let off = Settings {
+            node_bypass: false,
+            ..Settings::default()
+        };
+        let text = serde_json::to_string(&off).unwrap();
+        assert!(text.contains(r#""node_bypass":false"#), "{text}");
+        assert_eq!(serde_json::from_str::<Settings>(&text).unwrap(), off);
+    }
 
     fn sub(id: &str, enabled: bool) -> Subscription {
         Subscription {

@@ -44,7 +44,7 @@ is a route below — `scripts/check-api-contract.py` enforces both directions
 | USB | `GET /api/usb/status`, `PUT /api/usb/mode`, `/api/usb/default`, `/api/usb/powerbank` |
 | Power | `GET+PUT /api/device/charge-control` — manual stop/resume + limit enforcer with hysteresis, event-driven off `BSP_CHARGER_EVENT` |
 | Extras | TTL clamping (`GET /api/ttl/status`, `PUT /api/ttl/set`, `DELETE /api/ttl/clear`), AT console (`POST /api/at/send`, `GET /api/at/port`), signal/connection CSV loggers (`/api/logger/*`) |
-| Proxy (mihomo) | `GET /api/proxy/status`; `PUT /api/proxy/settings` (mode, preset, tun, cn_bypass, mixed_port); `POST /api/proxy/service` (start/stop/restart); `GET`/`POST`/`PUT /api/proxy/subscriptions`, `POST /api/proxy/subscriptions/delete` (X-Confirm), `POST /api/proxy/subscriptions/update`; `GET`/`PUT /api/proxy/groups`; `POST /api/proxy/delay`. Plus unauthenticated `GET /proxy.pac` for LAN devices |
+| Proxy (mihomo) | `GET /api/proxy/status`; `PUT /api/proxy/settings` (mode, preset, tun, cn_bypass, node_bypass, mixed_port); `POST /api/proxy/service` (start/stop/restart); `GET`/`POST`/`PUT /api/proxy/subscriptions`, `POST /api/proxy/subscriptions/delete` (X-Confirm), `POST /api/proxy/subscriptions/update`; `GET`/`PUT /api/proxy/groups`; `POST /api/proxy/delay`. Plus unauthenticated `GET /proxy.pac` for LAN devices |
 
 ## Architecture notes
 
@@ -188,24 +188,30 @@ release, GitHub SHA-256 verified on both ends).
   offload (measured 138–195 Mbit/s at ~0% mihomo CPU). Mainland IPv6 also
   returns early from the IPv6 notrack chain (below), so it stays tracked.
   Runtime only, re-asserted with the accepts, removed with them.
-- **Proxy servers past the TUN** (always on with the TUN; `relay.rs`): LAN
-  clients that run their own proxy client against the same servers reach
-  them as plain forwarded traffic. Through the TUN such a connection was
-  accepted by mihomo's stack and dialled again from the router, so it cost
-  mihomo CPU, got no IPA offload, and the client never saw the server's IPv4
-  address fail, so its own IPv4-to-IPv6 fallback could not work. Every 10
-  minutes, and on the tick after the config file changes, the agent takes the
-  `server` of every proxy in the live config and its proxy providers' files,
-  resolves names through mihomo (`/dns/query`, the resolver LAN clients use),
-  and keeps the global unicast addresses whose first matching
-  `IP-CIDR`/`IP-CIDR6` rule (inline, or inside a text or YAML rule set)
-  targets `DIRECT`. An address shared with other sites (a node behind a CDN)
-  is not listed like that, so it stays in the TUN; rules the agent cannot
-  evaluate for an address (`GEOIP`, `IP-ASN`, `mrs` sets) are skipped. The
+- **Proxy servers past the TUN** (`settings.node_bypass`, default on;
+  `relay.rs`): LAN clients that run their own proxy client against the same
+  servers reach them as plain forwarded traffic. Through the TUN such a
+  connection was accepted by mihomo's stack and dialled again from the
+  router, so it cost mihomo CPU, got no IPA offload, and the client never saw
+  the server's IPv4 address fail, so its own IPv4-to-IPv6 fallback could not
+  work. Every 10 minutes, and on the tick after the config file changes, the
+  agent takes the `server` of every proxy in the live config and its proxy
+  providers' files and resolves names through mihomo (`/dns/query`, the
+  resolver LAN clients use). With `node_bypass` on (like ShellCrash's node
+  bypass) every global unicast address is taken, so a node that moves to a
+  new address is followed at the next lookup. Off, only addresses whose first
+  matching `IP-CIDR`/`IP-CIDR6` rule (inline, or inside a text or YAML rule
+  set) targets `DIRECT` are taken, which keeps an address shared with other
+  sites (a node behind a CDN) in the TUN; rules the agent cannot evaluate for
+  an address (`GEOIP`, `IP-ASN`, `mrs` sets) are skipped. A query that fails
+  (controller error or any status but NOERROR) keeps that name's addresses
+  from the previous lookup, and the lookup is retried after 30 s. The
   addresses go into `mihomo-relay`/`mihomo-relay6`, which get the mainland
   bypass's mark and share its ip rule 8999 (removed only when neither uses
-  it); their IPv6 returns before the notrack. A lookup the controller fails
-  keeps the earlier addresses and is retried after 30 s.
+  it); their IPv6 returns before the notrack. `node_bypass_count` in the
+  status is the number of addresses sent past the TUN. The setting is
+  written to `manager.json` only when off, so an older agent still reads the
+  file.
 - **IPv6 and IPA offload**: ipacm offloads established IPv6 flows by their
   conntrack tuple (`IPv6CTEnabled` in `/etc/data/ipa/IPACM_cfg.xml`). A LAN
   flow routed into the TUN looks forwarded, so about 250 ms in the client's

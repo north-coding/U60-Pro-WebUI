@@ -53,6 +53,8 @@ export function mapProxyStatus(d: Record<string, unknown>): ProxyStatus {
     cn_bypass: boolLike(d.cn_bypass) ?? false,
     cn_bypass_active: boolLike(d.cn_bypass_active) ?? false,
     cn_bypass_available: boolLike(d.cn_bypass_available) ?? false,
+    node_bypass: boolLike(d.node_bypass) ?? true,
+    node_bypass_count: nonNegativeInt(d.node_bypass_count) ?? 0,
     mixed_port: nonNegativeInt(d.mixed_port),
     lan_ip: nonEmptyStr(d.lan_ip),
     proxy_address: nonEmptyStr(d.proxy_address),

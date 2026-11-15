@@ -235,6 +235,14 @@ export const proxy: Record<string, string> = {
     '访问中国大陆 IP 的连接不经过 mihomo，直接走路由器的硬件转发通道：更快，也更省 CPU 和电量。把大陆 IP 发往代理的规则对 TUN 流量不再生效。',
   'The mainland IP list is not installed on the router; run scripts/deploy-mihomo.sh once.': '路由器上还没有安装大陆 IP 列表，请运行一次 scripts/deploy-mihomo.sh。',
   'Mainland bypass on': '已开启国内流量绕过',
+  'Node addresses bypass TUN': '节点地址绕过 TUN',
+  '{n} addresses': '{n} 个地址',
+  'Connections from LAN devices to the proxy servers of the active config skip mihomo, so a proxy client on the device (Surge, Clash, …) reaches its nodes directly and its own IPv4-to-IPv6 fallback works. Addresses are looked up every 10 minutes.':
+    '局域网设备连当前配置里的代理服务器时不经过 mihomo，设备上自己的代理客户端（Surge、Clash 等）直连节点，它的 IPv4→IPv6 回退也能生效。地址每 10 分钟解析一次。',
+  'Only proxy servers that the rules send DIRECT by IP address skip mihomo; other node addresses go through the TUN.':
+    '只有规则按 IP 指定为 DIRECT 的代理服务器才绕过 mihomo，其他节点地址仍走 TUN。',
+  'Node bypass on': '已开启节点地址绕过',
+  'Node bypass follows the rules': '节点地址改为按规则绕过',
   'Mainland bypass off': '已关闭国内流量绕过',
 
   // zashboard panel

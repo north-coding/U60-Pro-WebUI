@@ -9,7 +9,7 @@ import CopyField from './CopyField'
 import { PRESET_OPTIONS, panelLink, validatePort } from './proxyView'
 import { t } from '../../i18n'
 
-type Busy = 'preset' | 'tun' | 'bypass' | 'port' | null
+type Busy = 'preset' | 'tun' | 'bypass' | 'nodes' | 'port' | null
 
 export default function SettingsTab({ status }: { status: PollResult<ProxyStatus> }) {
   const [busy, setBusy] = useState<Busy>(null)
@@ -139,6 +139,25 @@ export default function SettingsTab({ status }: { status: PollResult<ProxyStatus
             onChange={(v) => void save('bypass', { cn_bypass: v }, v ? t('Mainland bypass on') : t('Mainland bypass off'))}
             disabled={!!busy || !s.cn_bypass_available}
             label={t('Mainland traffic bypasses TUN')}
+          />
+        </div>
+        <div className="mt-3 flex items-start justify-between gap-4 border-t border-line/8 pt-3">
+          <div className="min-w-0">
+            <p className="flex flex-wrap items-center gap-2 text-body font-semibold text-ink">
+              {t('Node addresses bypass TUN')}
+              {s.tun_active && <Chip>{t('{n} addresses', { n: s.node_bypass_count })}</Chip>}
+            </p>
+            <p className="text-meta text-ink2">
+              {s.node_bypass
+                ? t('Connections from LAN devices to the proxy servers of the active config skip mihomo, so a proxy client on the device (Surge, Clash, …) reaches its nodes directly and its own IPv4-to-IPv6 fallback works. Addresses are looked up every 10 minutes.')
+                : t('Only proxy servers that the rules send DIRECT by IP address skip mihomo; other node addresses go through the TUN.')}
+            </p>
+          </div>
+          <Toggle
+            checked={s.node_bypass}
+            onChange={(v) => void save('nodes', { node_bypass: v }, v ? t('Node bypass on') : t('Node bypass follows the rules'))}
+            disabled={!!busy}
+            label={t('Node addresses bypass TUN')}
           />
         </div>
       </Card>

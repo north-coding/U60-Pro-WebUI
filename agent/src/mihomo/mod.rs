@@ -93,7 +93,9 @@ struct Inner {
     relay: Vec<std::net::IpAddr>,
     relay_checked: Option<Instant>,
     relay_config: Option<std::time::SystemTime>,
-    /// The last lookup was incomplete: retry soon, keep older addresses.
+    /// Last good answers, used for a name whose query fails.
+    relay_cache: relay::Cache,
+    /// The last lookup was incomplete: retry soon.
     relay_incomplete: bool,
 }
 
@@ -261,6 +263,7 @@ impl Manager {
                 relay: Vec::new(),
                 relay_checked: None,
                 relay_config: None,
+                relay_cache: relay::Cache::new(),
                 relay_incomplete: false,
             }),
         }
@@ -308,8 +311,8 @@ impl Manager {
                 }
                 // Lookups go through the controller: not under the lock.
                 let relay_due = me.lock().relay_due();
-                if let Some(config) = relay_due {
-                    let found = relay::find(&config, Path::new(service::DIR));
+                if let Some((config, all, cache)) = relay_due {
+                    let found = relay::find(&config, Path::new(service::DIR), all, &cache);
                     me.lock().relay_result(found);
                 }
                 let profile_due = me.lock().profile_due();
@@ -726,7 +729,7 @@ impl Inner {
     /// The live config when the proxy servers sent past the TUN are due to be
     /// looked up again: TUN running and RELAY_EVERY passed (RELAY_RETRY after
     /// an incomplete lookup), or the config file changed.
-    fn relay_due(&mut self) -> Option<Value> {
+    fn relay_due(&mut self) -> Option<(Value, bool, relay::Cache)> {
         if !(self.state.settings.tun && self.alive()) {
             return None;
         }
@@ -745,22 +748,24 @@ impl Inner {
         }
         self.relay_checked = Some(Instant::now());
         self.relay_config = modified;
-        fs::read(service::CONFIG)
+        let config = fs::read(service::CONFIG)
             .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
+            .and_then(|b| serde_json::from_slice(&b).ok())?;
+        Some((
+            config,
+            self.state.settings.node_bypass,
+            self.relay_cache.clone(),
+        ))
     }
 
-    /// Bring the proxy servers' bypass in line with a lookup. An incomplete
-    /// lookup keeps the addresses it could not confirm.
+    /// Bring the proxy servers' bypass in line with a lookup.
     fn relay_result(&mut self, found: relay::Found) {
         if !(self.state.settings.tun && self.alive()) {
             return;
         }
         self.relay_incomplete = !found.complete;
+        self.relay_cache = found.cache;
         let mut want = found.addresses;
-        if !found.complete {
-            want.extend(self.relay.iter().copied());
-        }
         want.sort_unstable();
         want.dedup();
         if want.is_empty() {
@@ -1024,6 +1029,8 @@ impl Inner {
             "cn_bypass": s.cn_bypass,
             "cn_bypass_active": self.bypass_active,
             "cn_bypass_available": service::bypass_available(),
+            "node_bypass": s.node_bypass,
+            "node_bypass_count": self.relay.len(),
             "mixed_port": s.mixed_port,
             "lan_ip": ip,
             "proxy_address": ip.as_ref().map(|ip| format!("{ip}:{}", s.mixed_port)),
@@ -1229,7 +1236,16 @@ impl Manager {
         let mut inner = self.lock();
         let mut next = inner.state.clone();
         for key in v.as_object().unwrap().keys() {
-            if !["mode", "preset", "tun", "cn_bypass", "mixed_port"].contains(&key.as_str()) {
+            if ![
+                "mode",
+                "preset",
+                "tun",
+                "cn_bypass",
+                "node_bypass",
+                "mixed_port",
+            ]
+            .contains(&key.as_str())
+            {
                 return bad(format!("unknown setting '{key}'"));
             }
         }
@@ -1255,6 +1271,12 @@ impl Manager {
             match b.as_bool() {
                 Some(b) => next.settings.cn_bypass = b,
                 None => return bad("cn_bypass must be a boolean"),
+            }
+        }
+        if let Some(b) = v.get("node_bypass") {
+            match b.as_bool() {
+                Some(b) => next.settings.node_bypass = b,
+                None => return bad("node_bypass must be a boolean"),
             }
         }
         if let Some(p) = v.get("mixed_port") {
@@ -1860,6 +1882,7 @@ mod tests {
                     relay: Vec::new(),
                     relay_checked: None,
                     relay_config: None,
+                    relay_cache: relay::Cache::new(),
                     relay_incomplete: false,
                 }),
             }

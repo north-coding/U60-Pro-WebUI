@@ -532,6 +532,10 @@ export interface ProxyStatus {
   cn_bypass_active: boolean
   /** The mainland IP list is installed on the router. */
   cn_bypass_available: boolean
+  /** With TUN: every proxy server of the active config skips mihomo (off: only those the rules send DIRECT by IP). */
+  node_bypass: boolean
+  /** Proxy server addresses currently sent past the TUN. */
+  node_bypass_count: number
   mixed_port?: number
   lan_ip?: string
   proxy_address?: string

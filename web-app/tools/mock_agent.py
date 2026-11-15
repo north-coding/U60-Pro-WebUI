@@ -1893,6 +1893,7 @@ def proxy_defaults():
         "preset": "bypass_cn",
         "tun": False,
         "cn_bypass": True,
+        "node_bypass": True,
         "mixed_port": 7890,
         "profile": "a1b2c3d4",
         "now": {"PROXY": "AUTO", "节点选择": "自动选择", "国外媒体": "节点选择", "苹果服务": "直接连接",
@@ -1961,6 +1962,7 @@ def proxy_status():
         "panel": {"installed": True, "url": "http://192.168.0.1:9097/ui/", "secret": None},
         "cn_bypass": p["cn_bypass"], "cn_bypass_active": p["tun"] and running and p["cn_bypass"],
         "cn_bypass_available": True,
+        "node_bypass": p["node_bypass"], "node_bypass_count": 9 if p["tun"] and running else 0,
         "proxy_address": f"192.168.0.1:{p['mixed_port']}", "pac_url": "http://192.168.0.1:9090/proxy.pac",
         "subscriptions": len(p["subs"]),
         "traffic": {"up_total": 182_000_000, "down_total": 4_310_000_000,
@@ -1985,6 +1987,8 @@ def put_proxy_settings(body):
             p["tun"] = value
         elif key == "cn_bypass" and isinstance(value, bool):
             p["cn_bypass"] = value
+        elif key == "node_bypass" and isinstance(value, bool):
+            p["node_bypass"] = value
         elif key == "mixed_port" and _is_int(value) and 1024 <= value <= 65535 and value not in (2222, 8080, 9090, 9097):
             p["mixed_port"] = value
         else:

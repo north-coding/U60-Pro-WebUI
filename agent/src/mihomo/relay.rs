@@ -8,15 +8,23 @@
 //! IPv4-to-IPv6 fallback never runs. Sent past the TUN (see
 //! `service::relay_add`), the flow is plain forwarded traffic again.
 //!
-//! An address is taken only when the active config already sends it DIRECT by
-//! an IP rule: the first `IP-CIDR`/`IP-CIDR6` rule that matches it, inline or
-//! inside a rule set, must target `DIRECT`. An address that is shared (a node
-//! behind a CDN) is not listed like that, so it stays in the TUN, where other
-//! sites on it are still routed by their names. Rules the agent cannot
-//! evaluate for an address (`GEOIP`, `IP-ASN`, binary `mrs` rule sets) and
-//! rules on names or processes are skipped.
+//! Two modes (`settings.node_bypass`):
+//! - on (default): every global unicast address of every proxy server, like
+//!   ShellCrash's "node bypass". A node that moves to a new address is
+//!   followed at the next lookup, with nothing to edit in the rules.
+//! - off: only addresses the active config already sends DIRECT by an IP
+//!   rule: the first `IP-CIDR`/`IP-CIDR6` rule that matches, inline or inside
+//!   a rule set, must target `DIRECT`. An address shared with other sites (a
+//!   node behind a CDN) is not listed like that, so it stays in the TUN, where
+//!   those sites are still routed by their names. Rules the agent cannot
+//!   evaluate for an address (`GEOIP`, `IP-ASN`, binary `mrs` rule sets) and
+//!   rules on names or processes are skipped.
+//!
+//! Names are resolved through mihomo (`/dns/query`), the resolver LAN clients
+//! get their answers from. A query that fails keeps that name's addresses from
+//! the previous lookup, so one DNS hiccup does not drop a node.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::net::IpAddr;
 use std::path::Path;
@@ -30,45 +38,81 @@ use super::controller::{segment, Controller};
 const MAX_HOSTS: usize = 64;
 const MAX_ADDRESSES: usize = 256;
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+const QTYPES: [&str; 2] = ["A", "AAAA"];
 
-/// The addresses to send past the TUN, and whether every server name was
-/// answered (a controller error leaves the result incomplete).
+/// Last good answer per (server name, query type).
+pub type Cache = HashMap<(String, &'static str), Vec<IpAddr>>;
+
+/// The addresses to send past the TUN, the answers to remember for the next
+/// lookup, and whether every query was answered (a failed one fell back to
+/// the cache).
 pub struct Found {
     pub addresses: Vec<IpAddr>,
+    pub cache: Cache,
     pub complete: bool,
 }
 
-/// Look up the active config's proxy servers and keep those its rules send
-/// DIRECT by address. Names go through mihomo's resolver (`/dns/query`), the
-/// one LAN clients get their answers from.
-pub fn find(config: &Value, dir: &Path) -> Found {
+/// One query's outcome: `Some(addresses)` for an answer (NOERROR, maybe
+/// empty), `None` when it failed (controller error, SERVFAIL, NXDOMAIN, …).
+type Lookup<'a> = dyn FnMut(&str, &str) -> Option<Vec<IpAddr>> + 'a;
+
+/// Look up the active config's proxy servers; with `all` keep every global
+/// unicast address, otherwise only those its rules send DIRECT by address.
+pub fn find(config: &Value, dir: &Path, all: bool, previous: &Cache) -> Found {
     let ctl = Controller;
-    let mut complete = true;
-    let mut candidates = BTreeSet::new();
-    for host in servers(config, dir).into_iter().take(MAX_HOSTS) {
-        if let Ok(ip) = host.parse::<IpAddr>() {
-            candidates.insert(ip);
-            continue;
-        }
-        for qtype in ["A", "AAAA"] {
-            let path = format!("/dns/query?name={}&type={qtype}", segment(&host));
-            match ctl.request("GET", &path, None, QUERY_TIMEOUT) {
-                Ok(reply) if reply.ok() => match reply.json() {
-                    Ok(v) => candidates.extend(answers(&v)),
-                    Err(_) => complete = false,
-                },
-                _ => complete = false,
-            }
-        }
-    }
-    let addresses = direct_by_address(config, dir, candidates.into_iter().filter(bypassable))
-        .into_iter()
-        .take(MAX_ADDRESSES)
-        .collect();
+    let mut query = |host: &str, qtype: &str| {
+        let path = format!("/dns/query?name={}&type={qtype}", segment(host));
+        let reply = ctl.request("GET", &path, None, QUERY_TIMEOUT).ok()?;
+        let v = reply.ok().then(|| reply.json().ok()).flatten()?;
+        (v["Status"].as_u64() == Some(0)).then(|| answers(&v))
+    };
+    let (candidates, cache, complete) = gather(&servers(config, dir), previous, &mut query);
+    let candidates = candidates.into_iter().filter(bypassable);
+    let picked: BTreeSet<IpAddr> = if all {
+        candidates.collect()
+    } else {
+        direct_by_address(config, dir, candidates)
+    };
     Found {
-        addresses,
+        addresses: picked.into_iter().take(MAX_ADDRESSES).collect(),
+        cache,
         complete,
     }
+}
+
+/// Resolve `hosts` (literal addresses pass through) with `lookup`. A failed
+/// query uses that name's entry in `previous`; the returned cache holds only
+/// the names asked about now.
+fn gather(
+    hosts: &BTreeSet<String>,
+    previous: &Cache,
+    lookup: &mut Lookup<'_>,
+) -> (BTreeSet<IpAddr>, Cache, bool) {
+    let mut addresses = BTreeSet::new();
+    let mut cache = Cache::new();
+    let mut complete = true;
+    for host in hosts.iter().take(MAX_HOSTS) {
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            addresses.insert(ip);
+            continue;
+        }
+        for qtype in QTYPES {
+            let key = (host.clone(), qtype);
+            let got = match lookup(host, qtype) {
+                Some(ips) => ips,
+                None => {
+                    complete = false;
+                    match previous.get(&key) {
+                        Some(ips) => ips.clone(),
+                        None => continue,
+                    }
+                }
+            };
+            addresses.extend(got.iter().copied());
+            cache.insert(key, got);
+        }
+    }
+    (addresses, cache, complete)
 }
 
 /// `server` of every proxy in the config and in its proxy providers' files.
@@ -401,6 +445,57 @@ mod tests {
             ]
         );
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_failed_query_keeps_the_previous_answer() {
+        let hosts: BTreeSet<String> =
+            ["relay-a.example.net", "relay-b.example.net", "203.0.113.10"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+        let mut previous = Cache::new();
+        previous.insert(
+            ("relay-a.example.net".into(), "A"),
+            vec![ip("198.51.100.1")],
+        );
+        previous.insert(
+            ("relay-a.example.net".into(), "AAAA"),
+            vec![ip("2001:db8:a::1")],
+        );
+        previous.insert(("gone.example.net".into(), "A"), vec![ip("198.51.100.99")]);
+        // relay-a: A answers with a new address, AAAA fails. relay-b: A answers
+        // empty (no record), AAAA fails with nothing cached.
+        let mut lookup = |host: &str, qtype: &str| match (host, qtype) {
+            ("relay-a.example.net", "A") => Some(vec![ip("198.51.100.2")]),
+            ("relay-b.example.net", "A") => Some(vec![]),
+            _ => None,
+        };
+        let (got, cache, complete) = gather(&hosts, &previous, &mut lookup);
+        assert!(!complete);
+        assert_eq!(
+            got.into_iter().collect::<Vec<_>>(),
+            vec![ip("198.51.100.2"), ip("203.0.113.10"), ip("2001:db8:a::1")]
+        );
+        // New answers replace old ones; names no longer in the config are dropped.
+        assert_eq!(
+            cache[&("relay-a.example.net".to_string(), "A")],
+            vec![ip("198.51.100.2")]
+        );
+        assert_eq!(
+            cache[&("relay-a.example.net".to_string(), "AAAA")],
+            vec![ip("2001:db8:a::1")]
+        );
+        assert_eq!(
+            cache[&("relay-b.example.net".to_string(), "A")],
+            Vec::<IpAddr>::new()
+        );
+        assert!(!cache.contains_key(&("relay-b.example.net".to_string(), "AAAA")));
+        assert!(!cache.contains_key(&("gone.example.net".to_string(), "A")));
+
+        let mut all_ok = |_: &str, _: &str| Some(vec![]);
+        let (_, _, complete) = gather(&hosts, &cache, &mut all_ok);
+        assert!(complete);
     }
 
     #[test]
