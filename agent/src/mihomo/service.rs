@@ -111,8 +111,15 @@ pub fn spawn() -> Result<Process, String> {
         .try_clone()
         .map_err(|e| format!("cannot open {LOG}: {e}"))?;
     let mut cmd = Command::new(BINARY);
+    // mihomo drops the TUN's IPv6 address whenever it parses a config while
+    // no interface has a global IPv6 address (config.parseIPV6). At boot the
+    // WAN often gets its /64 only later, so the TUN came up IPv4-only and
+    // stayed that way: LAN IPv6 bypassed the proxy until the next reload
+    // (2026-11-15). Keep IPv6 in the TUN regardless; without a WAN /64 the LAN
+    // has no global IPv6 to send into it anyway.
     cmd.args(["-d", DIR, "-f", CONFIG])
         .env("GOMEMLIMIT", "320MiB")
+        .env("SKIP_SYSTEM_IPV6_CHECK", "1")
         .stdin(Stdio::null())
         .stdout(log)
         .stderr(log_err);

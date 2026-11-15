@@ -151,6 +151,11 @@ release, GitHub SHA-256 verified on both ends).
   stop. A force-killed mihomo's ip rules (prefs 9000–9099, table 2022) are
   cleaned up. Nothing is written to the firmware: with TUN enabled the agent
   re-applies the rules at boot; turning TUN off restores the stock route.
+  mihomo is started with `SKIP_SYSTEM_IPV6_CHECK=1`: otherwise each config
+  parse drops the TUN's IPv6 address when no interface has a global IPv6
+  address, and since the WAN often gets its /64 minutes after boot, the TUN
+  came up IPv4-only and LAN IPv6 bypassed the proxy until the next reload
+  (2026-11-15).
 - **Mainland bypass** (`settings.cn_bypass`, default on): TUN costs about one
   A55 core per 100 Mbit/s (measured 2026-10-06: ~90 Mbit/s domestic at 80–90%
   of a core). With the bypass, LAN packets to mainland IPv4 and IPv6 ranges
