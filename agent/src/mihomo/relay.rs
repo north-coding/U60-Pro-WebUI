@@ -22,7 +22,12 @@
 //!
 //! Names are resolved through mihomo (`/dns/query`), the resolver LAN clients
 //! get their answers from. A query that fails keeps that name's addresses from
-//! the previous lookup, so one DNS hiccup does not drop a node.
+//! the previous lookup, so one DNS hiccup does not drop a node. mihomo answers
+//! from an expired cache entry with every TTL set to 1 and refreshes it in the
+//! background (`Resolver::ExchangeContext`); a lookup every 10 minutes nearly
+//! always lands on such an entry, so a TTL-1 answer is asked again after a
+//! second, until the refreshed one arrives. Without that, a node that moved
+//! stayed on its old address for a whole cycle or more (2026-11-15).
 
 use std::collections::{BTreeSet, HashMap};
 use std::fs;
@@ -38,6 +43,9 @@ use super::controller::{segment, Controller};
 const MAX_HOSTS: usize = 64;
 const MAX_ADDRESSES: usize = 256;
 const QUERY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Re-asks of a stale (TTL 1) answer, and the wait before each.
+const STALE_RETRIES: usize = 2;
+const STALE_WAIT: Duration = Duration::from_secs(1);
 const QTYPES: [&str; 2] = ["A", "AAAA"];
 
 /// Last good answer per (server name, query type).
@@ -60,11 +68,15 @@ type Lookup<'a> = dyn FnMut(&str, &str) -> Option<Vec<IpAddr>> + 'a;
 /// unicast address, otherwise only those its rules send DIRECT by address.
 pub fn find(config: &Value, dir: &Path, all: bool, previous: &Cache) -> Found {
     let ctl = Controller;
-    let mut query = |host: &str, qtype: &str| {
+    let ask = |host: &str, qtype: &str| -> Option<Value> {
         let path = format!("/dns/query?name={}&type={qtype}", segment(host));
         let reply = ctl.request("GET", &path, None, QUERY_TIMEOUT).ok()?;
-        let v = reply.ok().then(|| reply.json().ok()).flatten()?;
-        (v["Status"].as_u64() == Some(0)).then(|| answers(&v))
+        reply.ok().then(|| reply.json().ok()).flatten()
+    };
+    let mut query = |host: &str, qtype: &str| {
+        fresh_answer(&mut |h, t| ask(h, t), host, qtype, &mut || {
+            std::thread::sleep(STALE_WAIT)
+        })
     };
     let (candidates, cache, complete) = gather(&servers(config, dir), previous, &mut query);
     let candidates = candidates.into_iter().filter(bypassable);
@@ -78,6 +90,38 @@ pub fn find(config: &Value, dir: &Path, all: bool, previous: &Cache) -> Found {
         cache,
         complete,
     }
+}
+
+/// One query through `ask`, asked again (after `wait`) while mihomo answers
+/// from an expired cache entry. `None` when it failed or did not say NOERROR.
+fn fresh_answer(
+    ask: &mut dyn FnMut(&str, &str) -> Option<Value>,
+    host: &str,
+    qtype: &str,
+    wait: &mut dyn FnMut(),
+) -> Option<Vec<IpAddr>> {
+    let mut reply = ask(host, qtype)?;
+    for _ in 0..STALE_RETRIES {
+        if !stale(&reply) {
+            break;
+        }
+        wait();
+        match ask(host, qtype) {
+            Some(r) => reply = r,
+            None => break,
+        }
+    }
+    (reply["Status"].as_u64() == Some(0)).then(|| answers(&reply))
+}
+
+/// mihomo's mark for an answer served from an expired cache entry: records,
+/// and every one of them with TTL 1 (or less).
+fn stale(reply: &Value) -> bool {
+    let records = reply["Answer"].as_array().map_or(&[][..], Vec::as_slice);
+    !records.is_empty()
+        && records
+            .iter()
+            .all(|a| a["TTL"].as_u64().is_some_and(|t| t <= 1))
 }
 
 /// Resolve `hosts` (literal addresses pass through) with `lookup`. A failed
@@ -496,6 +540,58 @@ mod tests {
         let mut all_ok = |_: &str, _: &str| Some(vec![]);
         let (_, _, complete) = gather(&hosts, &cache, &mut all_ok);
         assert!(complete);
+    }
+
+    #[test]
+    fn a_stale_answer_is_asked_again_until_it_is_refreshed() {
+        let reply = |ttl: u64, ip: &str| json!({"Status": 0, "Answer": [{"type": 1, "TTL": ttl, "data": ip}]});
+        // Expired entry first, the refreshed one on the second ask.
+        let mut replies = vec![reply(1, "203.0.113.7"), reply(60, "203.0.113.8")].into_iter();
+        let mut waits = 0;
+        let got = fresh_answer(
+            &mut |_, _| replies.next(),
+            "relay-a.example.net",
+            "A",
+            &mut || waits += 1,
+        );
+        assert_eq!(got, Some(vec![ip("203.0.113.8")]));
+        assert_eq!(waits, 1);
+        // A record whose real TTL is 1 costs only the retries, then is used.
+        let mut waits = 0;
+        let got = fresh_answer(
+            &mut |_, _| Some(reply(1, "203.0.113.9")),
+            "h",
+            "A",
+            &mut || waits += 1,
+        );
+        assert_eq!(got, Some(vec![ip("203.0.113.9")]));
+        assert_eq!(waits, STALE_RETRIES);
+        // A fresh answer, an empty one and an NXDOMAIN are not asked again.
+        for r in [
+            reply(30, "203.0.113.1"),
+            json!({"Status": 0}),
+            json!({"Status": 3}),
+        ] {
+            let mut asks = 0;
+            let _ = fresh_answer(
+                &mut |_, _| {
+                    asks += 1;
+                    Some(r.clone())
+                },
+                "h",
+                "A",
+                &mut || {},
+            );
+            assert_eq!(asks, 1);
+        }
+        assert_eq!(
+            fresh_answer(&mut |_, _| Some(json!({"Status": 3})), "h", "A", &mut || {}),
+            None
+        );
+        // A retry that fails keeps the stale answer rather than nothing.
+        let mut first = Some(reply(1, "203.0.113.7"));
+        let got = fresh_answer(&mut |_, _| first.take(), "h", "A", &mut || {});
+        assert_eq!(got, Some(vec![ip("203.0.113.7")]));
     }
 
     #[test]
