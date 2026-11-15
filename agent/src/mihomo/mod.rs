@@ -607,7 +607,8 @@ impl Inner {
             }
             self.sync_bypass(&rules);
             self.sync_dns();
-        } else if !(self.state.settings.tun && self.alive()) && service::dns_forwarding() {
+        } else if !(self.state.settings.tun && self.alive()) {
+            // Idempotent: also keeps dnsmasq on the carrier's current resolvers.
             dns_forward_off();
         }
     }
@@ -630,8 +631,11 @@ impl Inner {
             }
         } else {
             self.dns_failures = self.dns_failures.saturating_add(1);
-            if self.dns_failures >= 2 && service::dns_forwarding() {
-                eprintln!("[mihomo] mihomo DNS not answering — LAN DNS back to the carrier");
+            if self.dns_failures >= 2 {
+                if service::dns_forwarding() {
+                    eprintln!("[mihomo] mihomo DNS not answering — LAN DNS back to the carrier");
+                }
+                // Repeated while it stays down, to follow the carrier's resolvers.
                 dns_forward_off();
             }
         }

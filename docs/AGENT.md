@@ -166,6 +166,17 @@ release, GitHub SHA-256 verified on both ends).
   main table ahead of sing-tun's rules, so they keep the stock path and IPA
   offload (measured 138–195 Mbit/s at ~0% mihomo CPU). Mainland IPv6 also
   returns early from the IPv6 notrack chain (below), so it stays tracked.
+- **LAN DNS**: while the TUN runs and mihomo's resolver (`127.0.0.1:1053`,
+  `redir-host`, so LAN clients get real addresses) answers, dnsmasq forwards
+  every name to it. The switch is `/tmp/mihomo-dns.servers`, named by
+  `/tmp/dnsmasq.d/mihomo-dns.conf` together with `no-resolv`, and re-read on
+  SIGHUP; only the first switch after a boot restarts dnsmasq. With
+  forwarding off the agent copies the carrier's resolvers from
+  `/etc/resolv.conf` into the servers-file and keeps them current. Without
+  `no-resolv`, dnsmasq 2.90 sent every query to mihomo and the carrier at
+  once and served the faster answer, so poisoned replies reached the LAN
+  (2026-11-15). Two failed checks hand DNS back to the carrier; each mihomo
+  reload flushes dnsmasq's cache.
   Runtime only, re-asserted with the accepts, removed with them.
 - **IPv6 and IPA offload**: ipacm offloads established IPv6 flows by their
   conntrack tuple (`IPv6CTEnabled` in `/etc/data/ipa/IPACM_cfg.xml`). A LAN

@@ -1052,11 +1052,44 @@ pub fn tun_active() -> bool {
 // SIGHUP, so turning forwarding on or off never restarts dnsmasq. The
 // conf-dir entry that names the file lives in /tmp: after a reboot dnsmasq
 // starts on the carrier's resolvers until the agent turns forwarding on.
+//
+// The conf-dir entry also sets `no-resolv`, so the servers-file holds all of
+// dnsmasq's upstreams: mihomo while forwarding is on, the carrier's resolvers
+// (copied from the resolv-file) while it is off. Without it dnsmasq 2.90
+// treats `server=/#/` as one more plain upstream next to the resolv-file's:
+// every name went to mihomo and the carrier at once and the faster answer
+// won, so poisoned replies (www.google.com AAAA 2001::1) reached the LAN
+// (2026-11-15).
 
 /// Read by dnsmasq at start (its uci `confdir`).
 const DNSMASQ_CONF: &str = "/tmp/dnsmasq.d/mihomo-dns.conf";
-/// Holds the forwarding line while forwarding is on, and is empty otherwise.
+/// dnsmasq's upstreams once the conf-dir entry is in place.
 const DNSMASQ_SERVERS: &str = "/tmp/mihomo-dns.servers";
+/// dnsmasq's uci `resolvfile`: the carrier's resolvers, kept by the firmware.
+const RESOLV_FILE: &str = "/etc/resolv.conf";
+
+fn conf_body() -> String {
+    format!("no-resolv\nservers-file={DNSMASQ_SERVERS}\n")
+}
+
+/// `server=` lines for the resolv-file's nameservers, minus loopback and
+/// unspecified addresses (dnsmasq itself, which would loop).
+fn carrier_lines(resolv: &str) -> String {
+    let mut seen = Vec::new();
+    for line in resolv.lines() {
+        let mut words = line.split_whitespace();
+        if words.next() != Some("nameserver") {
+            continue;
+        }
+        let Some(Ok(addr)) = words.next().map(str::parse::<std::net::IpAddr>) else {
+            continue;
+        };
+        if !addr.is_loopback() && !addr.is_unspecified() && !seen.contains(&addr) {
+            seen.push(addr);
+        }
+    }
+    seen.iter().map(|a| format!("server={a}\n")).collect()
+}
 
 fn forward_line() -> String {
     // `/#/` matches every name; more specific entries (`local=/lan/`) still win.
@@ -1067,9 +1100,11 @@ fn forward_line() -> String {
     )
 }
 
-/// True while dnsmasq is told to forward to mihomo.
+/// True while dnsmasq is told to forward to mihomo, and only to mihomo (an
+/// entry without `no-resolv` from an older agent does not count).
 pub fn dns_forwarding() -> bool {
     fs::read_to_string(DNSMASQ_SERVERS).is_ok_and(|s| s == forward_line())
+        && fs::read_to_string(DNSMASQ_CONF).is_ok_and(|c| c == conf_body())
 }
 
 /// SIGHUP: dnsmasq re-reads the servers-file and empties its cache.
@@ -1092,21 +1127,28 @@ fn hup_dnsmasq() {
     }
 }
 
-/// Point dnsmasq at mihomo (`on`) or back at its own resolvers.
+/// Point dnsmasq at mihomo (`on`) or back at the carrier's resolvers. Cheap
+/// and idempotent; called on every tick while forwarding is off, so the
+/// servers-file follows the resolv-file as `no-resolv` stops dnsmasq doing.
 pub fn dns_forward_set(on: bool) -> Result<(), String> {
-    let settled = if on {
-        dns_forwarding()
-    } else {
-        fs::metadata(DNSMASQ_SERVERS).map_or(true, |m| m.len() == 0)
-    };
-    if settled {
+    let conf_ok = fs::read_to_string(DNSMASQ_CONF).is_ok_and(|c| c == conf_body());
+    if !on && !Path::new(DNSMASQ_CONF).exists() {
+        // Never forwarded since boot: dnsmasq still reads its resolv-file.
         return Ok(());
     }
-    let body = if on { forward_line() } else { String::new() };
+    let body = if on {
+        forward_line()
+    } else {
+        carrier_lines(&fs::read_to_string(RESOLV_FILE).unwrap_or_default())
+    };
+    if conf_ok && fs::read_to_string(DNSMASQ_SERVERS).is_ok_and(|s| s == body) {
+        return Ok(());
+    }
     fs::write(DNSMASQ_SERVERS, body).map_err(|e| format!("cannot write {DNSMASQ_SERVERS}: {e}"))?;
-    if on && !Path::new(DNSMASQ_CONF).exists() {
-        // First use since boot: dnsmasq only learns the servers-file at start.
-        fs::write(DNSMASQ_CONF, format!("servers-file={DNSMASQ_SERVERS}\n"))
+    if !conf_ok {
+        // First use since boot, or an entry from an older agent: dnsmasq
+        // reads its conf-dir only at start.
+        fs::write(DNSMASQ_CONF, conf_body())
             .map_err(|e| format!("cannot write {DNSMASQ_CONF}: {e}"))?;
         let ok = Command::new("/etc/init.d/dnsmasq")
             .arg("restart")
@@ -1265,6 +1307,20 @@ mod tests {
         assert_eq!(cn6_return_rule()[0], NOTRACK_CHAIN);
         assert!(cn6_return_rule().contains(&CN6_SET));
         assert_eq!(notrack_rule(), [NOTRACK_CHAIN, "-j", "CT", "--notrack"]);
+    }
+
+    #[test]
+    fn carrier_resolvers_become_server_lines() {
+        let resolv = "# Interface zte_wan\nnameserver 192.0.2.53\nnameserver 192.0.2.53\n\
+                      # Interface zte_wan6\nnameserver 2001:db8:53::1\nnameserver 127.0.0.1\n\
+                      nameserver ::1\nnameserver 0.0.0.0\nsearch lan\nnameserver bogus\n";
+        assert_eq!(
+            carrier_lines(resolv),
+            "server=192.0.2.53\nserver=2001:db8:53::1\n"
+        );
+        assert_eq!(carrier_lines(""), "");
+        // The conf-dir entry must stop dnsmasq reading the resolv-file itself.
+        assert!(conf_body().lines().any(|l| l == "no-resolv"));
     }
 
     #[test]
