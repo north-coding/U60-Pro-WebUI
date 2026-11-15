@@ -187,9 +187,12 @@ release, GitHub SHA-256 verified on both ends).
   uhttpd's `:443` or nowhere) and REDIRECT (works for IPv4, but its NAT'd IPv6
   flows were offloaded the same way, and NAT cannot be untracked). The relay
   itself is not the agent's: `scripts/device/net-time-guard.sh` keeps odhcpd
-  relaying RA/DHCPv6, routes the WAN /64 on-link to `br-lan`, and keeps NDP
+  relaying RA/DHCPv6, routes the WAN /64 on-link to `br-lan`, keeps NDP
   relay off on the raw-IP WAN, where odhcpd used to route LAN clients out
-  the WAN.
+  the WAN, and sends odhcpd SIGHUP when the /64 changes and every 5 minutes.
+  The carrier answers odhcpd's RS but sent no unsolicited RA in any capture,
+  so without this a client that missed the RA for a new prefix had no global
+  IPv6 at all (2026-11-15).
 - **Forwarding watchdog**: every 60 s a mainland 204 endpoint is fetched
   through the mixed port (and directly when that fails, to rule out a WAN
   outage). Three failures through mihomo restart it; if it still does not

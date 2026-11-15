@@ -15,6 +15,14 @@
 #    then routed those clients to the WAN and answered NS (DAD too) for them
 #    on br-lan (2026-10-30). Only the router is advertised as the IPv6
 #    resolver, so every LAN lookup goes through dnsmasq (2026-11-04).
+#    The carrier sent no unsolicited RA in any capture; it only answers
+#    odhcpd's RS. So after the WAN /64 changes (five times in the first 35
+#    min after one boot) the LAN would hear of the new prefix only when a
+#    client solicits, and a client that slept through the change kept no
+#    global IPv6 (2026-11-15). SIGHUP makes odhcpd reload its unchanged config
+#    and send a fresh RS, and the answer is relayed to the LAN: done at once
+#    for a new prefix and every CHECK_SECS otherwise, like a router's own
+#    periodic RAs.
 # 2. Clock: ZTE's NITZ time sync writes Beijing wall time into the kernel
 #    clock while the OS timezone is UTC, so the epoch runs 8h fast. The OS
 #    timezone is CST-8 now; this keeps the kernel clock on true UTC using the
@@ -61,11 +69,24 @@ fix_v6_relay() {
     if [ $changed = 1 ]; then
         uci commit dhcp
         /etc/init.d/odhcpd restart >/dev/null 2>&1
+        RA_SENT=1         # a starting odhcpd solicits by itself
         log "dhcp IPv6 relay re-applied"
     fi
 }
 
+# Have odhcpd solicit the carrier's RA and relay it to the LAN.
+kick_ra() {
+    [ "$RA_SENT" = 1 ] && return 0
+    # odhcpd reads staged uci changes too; never act on another caller's.
+    [ -z "$(uci -q changes dhcp)" ] || return 0
+    pid=$(pidof odhcpd) || return 0
+    kill -HUP "$pid" && RA_SENT=1
+}
+
+# Sets V6_UP (the WAN has a /64) and V6_NEW (its route was just added).
 fix_v6_route() {
+    V6_UP=0
+    V6_NEW=0
     wan=$(ifstatus zte_wan6 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)
     [ -n "$wan" ] || return 0
     pfx=$(ip -6 addr show dev "$wan" scope global -deprecated -tentative 2>/dev/null |
@@ -74,10 +95,12 @@ fix_v6_route() {
         ip -6 route flush dev br-lan proto $V6_PROTO 2>/dev/null
         return 0
     fi
+    V6_UP=1
     # $pfx keeps the WAN address's host bits; ip masks them for both calls.
     if [ -z "$(ip -6 route show exact "$pfx" dev br-lan proto $V6_PROTO)" ]; then
         ip -6 route flush dev br-lan proto $V6_PROTO 2>/dev/null
         ip -6 route add "$pfx" dev br-lan proto $V6_PROTO \
+            && V6_NEW=1 \
             && log "LAN IPv6 $(ip -6 route show dev br-lan proto $V6_PROTO | awk '{ print $1; exit }') routed on-link"
     fi
     # Undo what odhcpd learned while NDP relay was on for the WAN: /128s to
@@ -115,11 +138,18 @@ fix_clock() {
 sleep $BOOT_DELAY
 n=0
 while :; do
-    if [ $((n % (CHECK_SECS / ROUTE_SECS))) = 0 ]; then
+    RA_SENT=0
+    periodic=0
+    [ $((n % (CHECK_SECS / ROUTE_SECS))) = 0 ] && periodic=1
+    if [ $periodic = 1 ]; then
         fix_v6_relay
         fix_clock
     fi
     fix_v6_route
+    if [ $V6_UP = 1 ] && { [ $V6_NEW = 1 ] || [ $periodic = 1 ]; }; then
+        kick_ra
+        [ $V6_NEW = 1 ] && [ $RA_SENT = 1 ] && log "RA re-solicited for the new prefix"
+    fi
     n=$((n + 1))
     sleep $ROUTE_SECS
 done
