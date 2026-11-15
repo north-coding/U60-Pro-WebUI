@@ -8,17 +8,13 @@
 //! IPv4-to-IPv6 fallback never runs. Sent past the TUN (see
 //! `service::relay_add`), the flow is plain forwarded traffic again.
 //!
-//! Two modes (`settings.node_bypass`):
-//! - on (default): every global unicast address of every proxy server, like
-//!   ShellCrash's "node bypass". A node that moves to a new address is
-//!   followed at the next lookup, with nothing to edit in the rules.
-//! - off: only addresses the active config already sends DIRECT by an IP
-//!   rule: the first `IP-CIDR`/`IP-CIDR6` rule that matches, inline or inside
-//!   a rule set, must target `DIRECT`. An address shared with other sites (a
-//!   node behind a CDN) is not listed like that, so it stays in the TUN, where
-//!   those sites are still routed by their names. Rules the agent cannot
-//!   evaluate for an address (`GEOIP`, `IP-ASN`, binary `mrs` rule sets) and
-//!   rules on names or processes are skipped.
+//! With `settings.node_bypass` on (the default), every global unicast address
+//! of every proxy server is taken, like ShellCrash's "node bypass": a node that
+//! moves to a new address is followed at the next lookup. Off, nothing is
+//! looked up and every node address stays in the TUN like other traffic. (Off
+//! used to keep the addresses the rules send DIRECT by IP; that mode went on
+//! 2026-11-16, once the devices that run their own proxy client skipped the
+//! TUN by MAC address and the user asked for the TUN to carry everything else.)
 //!
 //! Names are resolved through mihomo (`/dns/query`), the resolver LAN clients
 //! get their answers from. A query that fails keeps that name's addresses from
@@ -64,9 +60,9 @@ pub struct Found {
 /// empty), `None` when it failed (controller error, SERVFAIL, NXDOMAIN, …).
 type Lookup<'a> = dyn FnMut(&str, &str) -> Option<Vec<IpAddr>> + 'a;
 
-/// Look up the active config's proxy servers; with `all` keep every global
-/// unicast address, otherwise only those its rules send DIRECT by address.
-pub fn find(config: &Value, dir: &Path, all: bool, previous: &Cache) -> Found {
+/// Look up the active config's proxy servers and keep every global unicast
+/// address.
+pub fn find(config: &Value, dir: &Path, previous: &Cache) -> Found {
     let ctl = Controller;
     let ask = |host: &str, qtype: &str| -> Option<Value> {
         let path = format!("/dns/query?name={}&type={qtype}", segment(host));
@@ -79,12 +75,7 @@ pub fn find(config: &Value, dir: &Path, all: bool, previous: &Cache) -> Found {
         })
     };
     let (candidates, cache, complete) = gather(&servers(config, dir), previous, &mut query);
-    let candidates = candidates.into_iter().filter(bypassable);
-    let picked: BTreeSet<IpAddr> = if all {
-        candidates.collect()
-    } else {
-        direct_by_address(config, dir, candidates)
-    };
+    let picked: BTreeSet<IpAddr> = candidates.into_iter().filter(bypassable).collect();
     Found {
         addresses: picked.into_iter().take(MAX_ADDRESSES).collect(),
         cache,
@@ -219,134 +210,6 @@ pub fn bypassable(ip: &IpAddr) -> bool {
     }
 }
 
-/// An address prefix.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct Net {
-    addr: IpAddr,
-    len: u8,
-}
-
-impl Net {
-    /// `1.2.3.0/24`, `2001:db8::/32`, or a bare address (a host prefix).
-    pub fn parse(text: &str) -> Option<Net> {
-        let text = text.trim().trim_matches(|c| c == '\'' || c == '"');
-        let (addr, len) = match text.split_once('/') {
-            Some((a, l)) => (a.parse::<IpAddr>().ok()?, Some(l.parse::<u8>().ok()?)),
-            None => (text.parse::<IpAddr>().ok()?, None),
-        };
-        let max = if addr.is_ipv4() { 32 } else { 128 };
-        let len = len.unwrap_or(max);
-        (len <= max).then_some(Net { addr, len })
-    }
-
-    pub fn contains(&self, ip: &IpAddr) -> bool {
-        match (self.addr, ip) {
-            (IpAddr::V4(net), IpAddr::V4(ip)) => {
-                let mask = u32::MAX.checked_shl(32 - u32::from(self.len)).unwrap_or(0);
-                u32::from(net) & mask == u32::from(*ip) & mask
-            }
-            (IpAddr::V6(net), IpAddr::V6(ip)) => {
-                let mask = u128::MAX
-                    .checked_shl(128 - u32::from(self.len))
-                    .unwrap_or(0);
-                u128::from(net) & mask == u128::from(*ip) & mask
-            }
-            _ => false,
-        }
-    }
-}
-
-/// The `candidates` whose first matching IP rule targets DIRECT. Rules are
-/// read in order and a rule set's file only while some candidate is still
-/// undecided, so large lists after the deciding rule are never parsed.
-pub fn direct_by_address(
-    config: &Value,
-    dir: &Path,
-    candidates: impl IntoIterator<Item = IpAddr>,
-) -> BTreeSet<IpAddr> {
-    let mut undecided: Vec<IpAddr> = candidates.into_iter().collect();
-    let mut direct = BTreeSet::new();
-    for rule in config["rules"].as_array().into_iter().flatten() {
-        if undecided.is_empty() {
-            break;
-        }
-        let Some(rule) = rule.as_str() else { continue };
-        let parts: Vec<&str> = rule.split(',').map(str::trim).collect();
-        let (Some(kind), Some(payload), Some(target)) = (parts.first(), parts.get(1), parts.get(2))
-        else {
-            continue;
-        };
-        let nets = match kind.to_ascii_uppercase().as_str() {
-            "IP-CIDR" | "IP-CIDR6" => Net::parse(payload).into_iter().collect(),
-            "RULE-SET" => provider_nets(config, dir, payload),
-            _ => continue,
-        };
-        undecided.retain(|ip| {
-            if !nets.iter().any(|n| n.contains(ip)) {
-                return true;
-            }
-            if *target == "DIRECT" {
-                direct.insert(*ip);
-            }
-            false
-        });
-    }
-    direct
-}
-
-/// The IP prefixes in rule set `name`: `IP-CIDR`/`IP-CIDR6` lines of a
-/// classical set, every line of an ipcidr set; none for a domain set or a
-/// file that cannot be read.
-fn provider_nets(config: &Value, dir: &Path, name: &str) -> Vec<Net> {
-    let def = &config["rule-providers"][name];
-    let behavior = def["behavior"].as_str().unwrap_or("");
-    if behavior == "domain" {
-        return Vec::new();
-    }
-    let lines: Vec<String> = if let Some(inline) = def["payload"].as_array() {
-        inline
-            .iter()
-            .filter_map(|l| l.as_str().map(str::to_string))
-            .collect()
-    } else {
-        let Some(path) = def["path"].as_str() else {
-            return Vec::new();
-        };
-        let Ok(bytes) = fs::read(dir.join(path)) else {
-            return Vec::new();
-        };
-        match def["format"].as_str().unwrap_or("yaml") {
-            "text" => String::from_utf8_lossy(&bytes)
-                .lines()
-                .map(str::to_string)
-                .collect(),
-            "yaml" => super::profile::parse_yaml(&bytes)
-                .ok()
-                .and_then(|v| v["payload"].as_array().cloned())
-                .into_iter()
-                .flatten()
-                .filter_map(|l| l.as_str().map(str::to_string))
-                .collect(),
-            _ => return Vec::new(),
-        }
-    };
-    lines
-        .iter()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty() && !l.starts_with('#') && !l.starts_with("//"))
-        .filter_map(|l| {
-            if behavior == "ipcidr" {
-                return Net::parse(l);
-            }
-            let mut fields = l.split(',').map(str::trim);
-            match fields.next()?.to_ascii_uppercase().as_str() {
-                "IP-CIDR" | "IP-CIDR6" => Net::parse(fields.next()?),
-                _ => None,
-            }
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,21 +217,6 @@ mod tests {
 
     fn ip(s: &str) -> IpAddr {
         s.parse().unwrap()
-    }
-
-    #[test]
-    fn prefixes_parse_and_match_by_family() {
-        let n = Net::parse("203.0.113.0/24").unwrap();
-        assert!(n.contains(&ip("203.0.113.10")));
-        assert!(!n.contains(&ip("198.51.100.1")));
-        assert!(!n.contains(&ip("::1")));
-        let host = Net::parse("'2001:db8:2::11'").unwrap();
-        assert!(host.contains(&ip("2001:db8:2::11")));
-        assert!(!host.contains(&ip("2001:db8:2::1")));
-        assert!(Net::parse("0.0.0.0/0").unwrap().contains(&ip("8.8.8.8")));
-        assert!(Net::parse("::/0").unwrap().contains(&ip("2001:db8::1")));
-        assert!(Net::parse("1.2.3.4/33").is_none());
-        assert!(Net::parse("example.com").is_none());
     }
 
     #[test]
@@ -396,68 +244,6 @@ mod tests {
         ] {
             assert!(!bypassable(&ip(a)), "{a}");
         }
-    }
-
-    #[test]
-    fn first_matching_ip_rule_decides() {
-        let dir = std::env::temp_dir().join(format!("relay-test-{}", std::process::id()));
-        fs::create_dir_all(dir.join("rules")).unwrap();
-        fs::write(
-            dir.join("rules/proxy.list"),
-            "# proxied\nDOMAIN,mail.example.com\nIP-ASN,64496,no-resolve\nIP-CIDR6,2001:db8:3::1/128,no-resolve\n",
-        )
-        .unwrap();
-        fs::write(
-            dir.join("rules/direct.list"),
-            "DOMAIN-SUFFIX,example.org\nIP-CIDR,203.0.113.10/32,no-resolve\n\
-             IP-CIDR6,2001:db8:2::11/128,no-resolve\nIP-CIDR6,2001:db8:3::1/128\n",
-        )
-        .unwrap();
-        fs::write(
-            dir.join("rules/ai.yaml"),
-            "payload:\n  - 'IP-CIDR,192.0.2.0/24'\n",
-        )
-        .unwrap();
-        let config = json!({
-            "rule-providers": {
-                "ai": {"behavior": "classical", "format": "yaml", "path": "./rules/ai.yaml"},
-                "proxy": {"behavior": "classical", "format": "text", "path": "./rules/proxy.list"},
-                "direct": {"behavior": "classical", "format": "text", "path": "./rules/direct.list"},
-                "cdn": {"behavior": "ipcidr", "type": "inline", "payload": ["104.16.0.0/13"]},
-                "names": {"behavior": "domain", "format": "text", "path": "./rules/missing.list"},
-                "huge": {"behavior": "classical", "format": "text", "path": "./rules/never-read.list"}
-            },
-            "rules": [
-                "RULE-SET,ai,AI",
-                "GEOIP,US,美国",
-                "RULE-SET,names,节点选择",
-                "RULE-SET,proxy,节点选择,no-resolve",
-                "IP-CIDR,104.16.0.0/13,DIRECT,no-resolve",
-                "RULE-SET,cdn,节点选择",
-                "RULE-SET,direct,DIRECT,no-resolve",
-                "RULE-SET,huge,DIRECT",
-                "MATCH,DIRECT"
-            ]
-        });
-        let got = direct_by_address(
-            &config,
-            &dir,
-            [
-                ip("203.0.113.10"),
-                ip("2001:db8:2::11"),
-                ip("2001:db8:3::1"),
-                ip("192.0.2.10"),
-                ip("104.17.1.1"),
-                ip("9.9.9.9"),
-            ],
-        );
-        // Proxied before DIRECT, AI-routed, unlisted (MATCH is not an IP rule):
-        // all stay in the TUN. The inline DIRECT CIDR is honoured.
-        assert_eq!(
-            got.into_iter().collect::<Vec<_>>(),
-            vec![ip("104.17.1.1"), ip("203.0.113.10"), ip("2001:db8:2::11"),]
-        );
-        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]

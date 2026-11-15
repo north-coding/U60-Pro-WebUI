@@ -1,119 +1,51 @@
 #!/bin/sh
 # net_time_guard.sh — keep two firmware-reverted settings in place.
 #
-# 1. LAN IPv6: the carrier gives a single /64 with no prefix delegation, so
-#    odhcpd must relay RA/DHCPv6 from zte_wan6 to the LAN. zte_router
-#    rewrites dhcp.lan back to ra/dhcpv6=server on every boot, which leaves
-#    clients without a global IPv6. With IPA and the mihomo TUN also on, the
-#    agent keeps TUN'd IPv6 untracked so IPA offload cannot stall it.
-#    The /64 is also routed on-link to br-lan. odhcpd's learned /128s alone
-#    are not enough: the kernel drops an idle neighbour after about a minute
-#    (gc_thresh1=1 here), odhcpd then drops its route, and replies to that
-#    client follow the default route back out the WAN. NDP relay stays off
-#    on zte_wan6. The WAN is raw IP, so the pings odhcpd sends there for
-#    every LAN NS leave NOARP neighbours that it takes for upstream hosts; it
-#    then routed those clients to the WAN and answered NS (DAD too) for them
-#    on br-lan (2026-10-30). Only the router is advertised as the IPv6
-#    resolver, so every LAN lookup goes through dnsmasq (2026-11-04).
-#    The carrier sent no unsolicited RA in any capture; it only answers
-#    odhcpd's RS. So after the WAN /64 changes (five times in the first 35
-#    min after one boot) the LAN would hear of the new prefix only when a
-#    client solicits, and a client that slept through the change kept no
-#    global IPv6 (2026-11-15). SIGHUP makes odhcpd reload its unchanged config
-#    and send a fresh RS, and the answer is relayed to the LAN: done at once
-#    for a new prefix and every CHECK_SECS otherwise, like a router's own
-#    periodic RAs.
+# 1. LAN IPv6 off. The carrier gives one /64 and no prefix delegation, so
+#    LAN clients could have global IPv6 only through odhcpd relaying the
+#    carrier's RA, and that took an on-link /64 route, RS kicks after every
+#    prefix change and an IPA notrack in the agent, and still left clients on
+#    dead prefixes after WAN reconnects (2026-10-28 to 11-15). Since
+#    2026-11-16 the LAN is IPv4 only, at the user's request: odhcpd sends no
+#    RA, serves no DHCPv6 and relays no NDP on lan. zte_router writes
+#    dhcp.lan back to ra/dhcpv6=server at boot and after WAN events (eight
+#    times in four hours on 2026-11-15), so it is checked every CHECK_SECS.
+#    Its server-mode RAs in between carry no prefix (br-lan has no global
+#    address), so clients get no global IPv6 from them; switching relay to
+#    server also made a Mac drop its IPv6 default route and deprecate the
+#    relayed prefix at once (2026-11-16). dhcp.wan_v6 (relay master, NDP
+#    relay off) is left as it is: with no LAN slave it relays nothing. The
+#    router's own WAN IPv6 does not depend on odhcpd.
 # 2. Clock: ZTE's NITZ time sync writes Beijing wall time into the kernel
-#    clock while the OS timezone is UTC, so the epoch runs 8h fast. The OS
-#    timezone is CST-8 now; this keeps the kernel clock on true UTC using the
-#    Date header of a domestic HTTP server (no ntpd on this firmware).
+#    clock while the OS timezone is UTC, so the epoch runs 8h fast (again
+#    after every WAN reconnect). The OS timezone is CST-8 now; this keeps the
+#    kernel clock on true UTC using the Date header of a domestic HTTP server
+#    (no ntpd on this firmware).
 #
 # Runs from rc.local; survives via nohup. Logs to /tmp/net_time_guard.log
 # (rotated at 32KB).
 
 LOG=/tmp/net_time_guard.log
 BOOT_DELAY=90             # let zte_router finish its boot-time rewrites
-CHECK_SECS=300
-ROUTE_SECS=15             # re-check the LAN /64 route (tracks a new WAN prefix)
-V6_PROTO=99               # route protocol tag of the /64 this script owns
+CHECK_SECS=15             # dhcp.lan check (three uci reads)
+CLOCK_SECS=300
 MAX_SKEW=60
 MAX_LOG=32768
 TIME_URLS="http://www.baidu.com http://www.qq.com http://www.aliyun.com"
 
 log() { echo "$(date '+%F %T') $*" >> "$LOG"; [ -s "$LOG" ] && [ "$(wc -c < "$LOG")" -gt $MAX_LOG ] && tail -c $((MAX_LOG / 2)) "$LOG" > "$LOG.new" 2>/dev/null && mv "$LOG.new" "$LOG"; }
 
-fix_v6_relay() {
+lan_v6_off() {
     # Do not commit another caller's staged DHCP changes.
     [ -z "$(uci -q changes dhcp)" ] || return 0
     changed=0
-    want() { [ "$(uci -q get "$1")" = "$2" ] || { uci set "$1=$2"; changed=1; }; }
-    want dhcp.wan_v6.interface zte_wan6
-    want dhcp.wan_v6.master 1
-    want dhcp.wan_v6.ndp disabled
-    for o in ra dhcpv6; do
-        want dhcp.wan_v6.$o relay
-    done
     for o in ra dhcpv6 ndp; do
-        want dhcp.lan.$o relay
+        [ "$(uci -q get dhcp.lan.$o)" = disabled ] || { uci set dhcp.lan.$o=disabled; changed=1; }
     done
-    # Advertise only the router as the LAN's IPv6 resolver. The firmware
-    # lists the carrier's resolvers here too, and clients that pick those
-    # bypass dnsmasq (and mihomo behind it) entirely.
-    ll=$(ip -6 addr show dev br-lan scope link 2>/dev/null |
-        awk '$1 == "inet6" { split($2, a, "/"); print a[1]; exit }')
-    if [ -n "$ll" ] && [ "$(uci -q get dhcp.lan.dns)" != "$ll" ]; then
-        uci -q delete dhcp.lan.dns
-        uci add_list dhcp.lan.dns="$ll"
-        changed=1
-    fi
-    if [ $changed = 1 ]; then
-        uci commit dhcp
-        /etc/init.d/odhcpd restart >/dev/null 2>&1
-        RA_SENT=1         # a starting odhcpd solicits by itself
-        log "dhcp IPv6 relay re-applied"
-    fi
-}
-
-# Have odhcpd solicit the carrier's RA and relay it to the LAN.
-kick_ra() {
-    [ "$RA_SENT" = 1 ] && return 0
-    # odhcpd reads staged uci changes too; never act on another caller's.
-    [ -z "$(uci -q changes dhcp)" ] || return 0
-    pid=$(pidof odhcpd) || return 0
-    kill -HUP "$pid" && RA_SENT=1
-}
-
-# Sets V6_UP (the WAN has a /64) and V6_NEW (its route was just added).
-fix_v6_route() {
-    V6_UP=0
-    V6_NEW=0
-    wan=$(ifstatus zte_wan6 2>/dev/null | jsonfilter -e '@.l3_device' 2>/dev/null)
-    [ -n "$wan" ] || return 0
-    pfx=$(ip -6 addr show dev "$wan" scope global -deprecated -tentative 2>/dev/null |
-        awk '$1 == "inet6" && $2 ~ /\/64$/ { print $2; exit }')
-    if [ -z "$pfx" ]; then
-        ip -6 route flush dev br-lan proto $V6_PROTO 2>/dev/null
-        return 0
-    fi
-    V6_UP=1
-    # $pfx keeps the WAN address's host bits; ip masks them for both calls.
-    if [ -z "$(ip -6 route show exact "$pfx" dev br-lan proto $V6_PROTO)" ]; then
-        ip -6 route flush dev br-lan proto $V6_PROTO 2>/dev/null
-        ip -6 route add "$pfx" dev br-lan proto $V6_PROTO \
-            && V6_NEW=1 \
-            && log "LAN IPv6 $(ip -6 route show dev br-lan proto $V6_PROTO | awk '{ print $1; exit }') routed on-link"
-    fi
-    # Undo what odhcpd learned while NDP relay was on for the WAN: /128s to
-    # LAN clients via the WAN, and proxy entries for them. odhcpd ignores
-    # events on the WAN now, so it would never remove them itself.
-    ip -6 route show root "$pfx" dev "$wan" 2>/dev/null | while read -r dst _; do
-        case $dst in */*) ;; *) ip -6 route del "$dst" dev "$wan" ;; esac
-    done
-    for dev in br-lan "$wan"; do
-        ip -6 neigh show proxy to "$pfx" dev "$dev" 2>/dev/null | while read -r dst _; do
-            ip -6 neigh del proxy "$dst" dev "$dev"
-        done
-    done
+    [ $changed = 1 ] || return 0
+    uci commit dhcp
+    /etc/init.d/odhcpd restart >/dev/null 2>&1
+    log "LAN IPv6 turned off again (dhcp.lan ra/dhcpv6/ndp disabled)"
 }
 
 fix_clock() {
@@ -138,18 +70,8 @@ fix_clock() {
 sleep $BOOT_DELAY
 n=0
 while :; do
-    RA_SENT=0
-    periodic=0
-    [ $((n % (CHECK_SECS / ROUTE_SECS))) = 0 ] && periodic=1
-    if [ $periodic = 1 ]; then
-        fix_v6_relay
-        fix_clock
-    fi
-    fix_v6_route
-    if [ $V6_UP = 1 ] && { [ $V6_NEW = 1 ] || [ $periodic = 1 ]; }; then
-        kick_ra
-        [ $V6_NEW = 1 ] && [ $RA_SENT = 1 ] && log "RA re-solicited for the new prefix"
-    fi
+    lan_v6_off
+    [ $((n % (CLOCK_SECS / CHECK_SECS))) = 0 ] && fix_clock
     n=$((n + 1))
-    sleep $ROUTE_SECS
+    sleep $CHECK_SECS
 done

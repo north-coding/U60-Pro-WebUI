@@ -532,10 +532,14 @@ export interface ProxyStatus {
   cn_bypass_active: boolean
   /** The mainland IP list is installed on the router. */
   cn_bypass_available: boolean
-  /** With TUN: every proxy server of the active config skips mihomo (off: only those the rules send DIRECT by IP). */
+  /** With TUN: every proxy server of the active config skips mihomo (off: node addresses stay in the TUN). */
   node_bypass: boolean
   /** Proxy server addresses currently sent past the TUN. */
   node_bypass_count: number
+  /** With TUN: LAN devices (MAC addresses, `AA:BB:…`) whose traffic skips mihomo entirely. */
+  bypass_macs: string[]
+  /** The rules for exactly those devices are in place. */
+  bypass_macs_active: boolean
   mixed_port?: number
   lan_ip?: string
   proxy_address?: string

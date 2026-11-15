@@ -1135,6 +1135,7 @@ export const api = {
     tun?: boolean
     cn_bypass?: boolean
     node_bypass?: boolean
+    bypass_macs?: string[]
     mixed_port?: number
   }) =>
     req('PUT', '/api/proxy/settings', body, undefined, 45_000).then(mapProxyStatus),

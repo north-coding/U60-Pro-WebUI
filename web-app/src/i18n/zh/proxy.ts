@@ -239,11 +239,26 @@ export const proxy: Record<string, string> = {
   '{n} addresses': '{n} 个地址',
   'Connections from LAN devices to the proxy servers of the active config skip mihomo, so a proxy client on the device (Surge, Clash, …) reaches its nodes directly and its own IPv4-to-IPv6 fallback works. Addresses are looked up every 10 minutes.':
     '局域网设备连当前配置里的代理服务器时不经过 mihomo，设备上自己的代理客户端（Surge、Clash 等）直连节点，它的 IPv4→IPv6 回退也能生效。地址每 10 分钟解析一次。',
-  'Only proxy servers that the rules send DIRECT by IP address skip mihomo; other node addresses go through the TUN.':
-    '只有规则按 IP 指定为 DIRECT 的代理服务器才绕过 mihomo，其他节点地址仍走 TUN。',
+  'Node addresses go through the TUN like all other traffic.': '节点地址和其他流量一样走 TUN。',
   'Node bypass on': '已开启节点地址绕过',
-  'Node bypass follows the rules': '节点地址改为按规则绕过',
+  'Node bypass off': '已关闭节点地址绕过',
   'Mainland bypass off': '已关闭国内流量绕过',
+
+  // Devices without proxy
+  'Devices without proxy': '不走代理的设备',
+  'These devices skip mihomo entirely, IPv4 and IPv6, as if no proxy ran: for devices with their own proxy client (Surge, Shadowrocket, …). They are recognised by MAC address, so set their private Wi-Fi address to Fixed. DNS sent to the router is still answered through mihomo’s resolver.':
+    '这些设备的流量完全不经过 mihomo（IPv4 和 IPv6 都是），就像路由器没有开代理，适合自带代理客户端（Surge、Shadowrocket 等）的设备。按 MAC 地址识别，请把设备的私有 Wi-Fi 地址设为“固定”。发给路由器的 DNS 查询仍由 mihomo 解析。',
+  'Takes effect while the transparent proxy (TUN) is running; without it every device already goes direct.':
+    '透明代理（TUN）运行时生效；不开 TUN 时所有设备本来就是直连。',
+  'Not connected': '未连接',
+  'Add device': '添加设备',
+  'This device is already on the list': '这台设备已在列表中',
+  'Send {name} past the proxy?': '让 {name} 不走代理？',
+  'Everything this device sends skips mihomo and goes out the router’s normal route.': '这台设备的所有流量都不经过 mihomo，走路由器的普通线路。',
+  'Its open connections through mihomo close; its apps reconnect directly.': '它经过 mihomo 的现有连接会被关闭，应用会直接重新连接。',
+  'Remove it from this list to send it through the proxy again.': '从列表中删除即可恢复走代理。',
+  'Send {name} through the proxy again?': '让 {name} 恢复走代理？',
+  'Its open direct connections drop; its apps reconnect through mihomo.': '它现有的直连会断开，应用会经由 mihomo 重新连接。',
 
   // zashboard panel
   'Web panel (zashboard)': '管理面板（zashboard）',

@@ -30,6 +30,7 @@ const MAX_SUBSCRIPTIONS: usize = 16;
 const MAX_NAME_CHARS: usize = 32;
 const MAX_URL_LEN: usize = 2048;
 const MAX_INTERVAL_HOURS: u32 = 720;
+const MAX_BYPASS_MACS: usize = 32;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -74,11 +75,16 @@ pub struct Settings {
     /// (stock path, hardware offload) instead of through mihomo.
     pub cn_bypass: bool,
     /// With TUN: send LAN traffic to every proxy server of the active config
-    /// past the TUN (relay.rs); off: only servers the rules send DIRECT by IP.
+    /// past the TUN (relay.rs); off: node addresses stay in the TUN.
     /// Written only when off, so an older agent (deny_unknown_fields) still
     /// reads a state file that leaves it at the default.
     #[serde(skip_serializing_if = "is_true")]
     pub node_bypass: bool,
+    /// With TUN: LAN devices (MAC addresses, `AA:BB:…`) whose traffic skips
+    /// the TUN entirely, IPv4 and IPv6, as if no proxy ran. Written only when
+    /// set, so an older agent still reads a state file without devices.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub bypass_macs: Vec<String>,
     pub mixed_port: u16,
     /// Subscription whose own full config (groups, rules, rule sets) is used.
     /// `None`: the managed config (subscriptions as node providers + `preset`).
@@ -98,6 +104,7 @@ impl Default for Settings {
             tun: false,
             cn_bypass: true,
             node_bypass: true,
+            bypass_macs: Vec::new(),
             mixed_port: DEFAULT_PORT,
             profile: None,
         }
@@ -214,6 +221,33 @@ pub fn validate_port(port: u64) -> Result<u16, String> {
         1024..=65535 if ![2222, 8080, 9090, 9097].contains(&port) => Ok(port as u16),
         _ => Err("mixed_port must be 1024-65535 and not 2222, 8080, 9090 or 9097".into()),
     }
+}
+
+/// The devices sent past the TUN: a list of unicast MAC addresses, returned
+/// normalized (`AA:BB:CC:DD:EE:FF`), deduplicated, in the given order.
+pub fn validate_bypass_macs(value: &serde_json::Value) -> Result<Vec<String>, String> {
+    const ERR: &str = "bypass_macs must be a list of device MAC addresses";
+    let list = value.as_array().ok_or(ERR)?;
+    let mut macs: Vec<String> = Vec::new();
+    for item in list {
+        let mac = item
+            .as_str()
+            .and_then(crate::clients::normalize_mac)
+            .ok_or(ERR)?;
+        let first = u8::from_str_radix(&mac[..2], 16).unwrap_or(1);
+        if first & 1 != 0 || mac == "00:00:00:00:00:00" {
+            return Err(format!("{mac} is not a device (unicast) MAC address"));
+        }
+        if !macs.contains(&mac) {
+            macs.push(mac);
+        }
+    }
+    if macs.len() > MAX_BYPASS_MACS {
+        return Err(format!(
+            "at most {MAX_BYPASS_MACS} devices can bypass the proxy"
+        ));
+    }
+    Ok(macs)
 }
 
 pub fn can_add_subscription(state: &State) -> Result<(), String> {
@@ -563,6 +597,50 @@ mod tests {
         let text = serde_json::to_string(&off).unwrap();
         assert!(text.contains(r#""node_bypass":false"#), "{text}");
         assert_eq!(serde_json::from_str::<Settings>(&text).unwrap(), off);
+    }
+
+    #[test]
+    fn bypass_macs_are_written_only_when_set() {
+        let none = Settings::default();
+        let text = serde_json::to_string(&none).unwrap();
+        assert!(!text.contains("bypass_macs"), "{text}");
+        let some = Settings {
+            bypass_macs: vec!["00:00:5E:00:53:01".into()],
+            ..Settings::default()
+        };
+        let text = serde_json::to_string(&some).unwrap();
+        assert!(
+            text.contains(r#""bypass_macs":["00:00:5E:00:53:01"]"#),
+            "{text}"
+        );
+        assert_eq!(serde_json::from_str::<Settings>(&text).unwrap(), some);
+    }
+
+    #[test]
+    fn bypass_macs_are_validated_and_normalized() {
+        let ok = validate_bypass_macs(&serde_json::json!([
+            "00-00-5e-00-53-01",
+            "02:00:00:00:00:0a",
+            "00:00:5E:00:53:01"
+        ]))
+        .unwrap();
+        assert_eq!(ok, vec!["00:00:5E:00:53:01", "02:00:00:00:00:0A"]);
+        assert_eq!(
+            validate_bypass_macs(&serde_json::json!([])).unwrap(),
+            Vec::<String>::new()
+        );
+        for bad in [
+            serde_json::json!("00:00:5e:00:53:01"),
+            serde_json::json!(["00:00:5e:00:53"]),
+            serde_json::json!([1]),
+            serde_json::json!(["01:00:5e:00:00:01"]),
+            serde_json::json!(["ff:ff:ff:ff:ff:ff"]),
+            serde_json::json!(["00:00:00:00:00:00"]),
+        ] {
+            assert!(validate_bypass_macs(&bad).is_err(), "{bad}");
+        }
+        let many: Vec<String> = (0..33).map(|i| format!("02:00:00:00:00:{i:02x}")).collect();
+        assert!(validate_bypass_macs(&serde_json::json!(many)).is_err());
     }
 
     fn sub(id: &str, enabled: bool) -> Subscription {

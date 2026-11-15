@@ -233,7 +233,7 @@ afterwards):
 | `scripts/device/net-time-guard.sh` | `/data/local/tmp/net_time_guard.sh` | `sh /data/local/tmp/net_time_guard.sh >/dev/null 2>&1 &` |
 | `scripts/device/smart-manage-guard.sh` | `/data/local/tmp/smart_manage_guard.sh` | `sh /data/local/tmp/smart_manage_guard.sh >/dev/null 2>&1 &` |
 
-`net-time-guard` keeps the LAN IPv6 relay and the kernel clock in place
+`net-time-guard` keeps LAN IPv6 off and the kernel clock on UTC
 ([AGENT.md](AGENT.md)); `smart-manage-guard` restarts the leaking
 `zte_smart_manage` past 256 MB RSS ([SAFETY.md](SAFETY.md)). They log to
 `/tmp/net_time_guard.log` and `/tmp/smart_manage_guard.log`. Like the other

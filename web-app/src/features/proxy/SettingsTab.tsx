@@ -6,6 +6,7 @@ import { Button, Field, Input, Segmented, Toggle } from '../../ui/controls'
 import { confirm, toast, toastError } from '../../ui/feedback'
 import { Card, Chip, InlineStatus, Row, Skeleton } from '../../ui/primitives'
 import CopyField from './CopyField'
+import DirectDevicesCard from './DirectDevicesCard'
 import { PRESET_OPTIONS, panelLink, validatePort } from './proxyView'
 import { t } from '../../i18n'
 
@@ -150,17 +151,19 @@ export default function SettingsTab({ status }: { status: PollResult<ProxyStatus
             <p className="text-meta text-ink2">
               {s.node_bypass
                 ? t('Connections from LAN devices to the proxy servers of the active config skip mihomo, so a proxy client on the device (Surge, Clash, …) reaches its nodes directly and its own IPv4-to-IPv6 fallback works. Addresses are looked up every 10 minutes.')
-                : t('Only proxy servers that the rules send DIRECT by IP address skip mihomo; other node addresses go through the TUN.')}
+                : t('Node addresses go through the TUN like all other traffic.')}
             </p>
           </div>
           <Toggle
             checked={s.node_bypass}
-            onChange={(v) => void save('nodes', { node_bypass: v }, v ? t('Node bypass on') : t('Node bypass follows the rules'))}
+            onChange={(v) => void save('nodes', { node_bypass: v }, v ? t('Node bypass on') : t('Node bypass off'))}
             disabled={!!busy}
             label={t('Node addresses bypass TUN')}
           />
         </div>
       </Card>
+
+      <DirectDevicesCard status={status} />
 
       <Card title={t('Web panel (zashboard)')}>
         {s.panel?.installed && s.panel.url ? (

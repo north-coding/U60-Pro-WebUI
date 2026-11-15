@@ -44,7 +44,7 @@ is a route below — `scripts/check-api-contract.py` enforces both directions
 | USB | `GET /api/usb/status`, `PUT /api/usb/mode`, `/api/usb/default`, `/api/usb/powerbank` |
 | Power | `GET+PUT /api/device/charge-control` — manual stop/resume + limit enforcer with hysteresis, event-driven off `BSP_CHARGER_EVENT` |
 | Extras | TTL clamping (`GET /api/ttl/status`, `PUT /api/ttl/set`, `DELETE /api/ttl/clear`), AT console (`POST /api/at/send`, `GET /api/at/port`), signal/connection CSV loggers (`/api/logger/*`) |
-| Proxy (mihomo) | `GET /api/proxy/status`; `PUT /api/proxy/settings` (mode, preset, tun, cn_bypass, node_bypass, mixed_port); `POST /api/proxy/service` (start/stop/restart); `GET`/`POST`/`PUT /api/proxy/subscriptions`, `POST /api/proxy/subscriptions/delete` (X-Confirm), `POST /api/proxy/subscriptions/update`; `GET`/`PUT /api/proxy/groups`; `POST /api/proxy/delay`. Plus unauthenticated `GET /proxy.pac` for LAN devices |
+| Proxy (mihomo) | `GET /api/proxy/status`; `PUT /api/proxy/settings` (mode, preset, tun, cn_bypass, node_bypass, bypass_macs, mixed_port); `POST /api/proxy/service` (start/stop/restart); `GET`/`POST`/`PUT /api/proxy/subscriptions`, `POST /api/proxy/subscriptions/delete` (X-Confirm), `POST /api/proxy/subscriptions/update`; `GET`/`PUT /api/proxy/groups`; `POST /api/proxy/delay`. Plus unauthenticated `GET /proxy.pac` for LAN devices |
 
 ## Architecture notes
 
@@ -197,13 +197,13 @@ release, GitHub SHA-256 verified on both ends).
   work. Every 10 minutes, and on the tick after the config file changes, the
   agent takes the `server` of every proxy in the live config and its proxy
   providers' files and resolves names through mihomo (`/dns/query`, the
-  resolver LAN clients use). With `node_bypass` on (like ShellCrash's node
-  bypass) every global unicast address is taken, so a node that moves to a
-  new address is followed at the next lookup. Off, only addresses whose first
-  matching `IP-CIDR`/`IP-CIDR6` rule (inline, or inside a text or YAML rule
-  set) targets `DIRECT` are taken, which keeps an address shared with other
-  sites (a node behind a CDN) in the TUN; rules the agent cannot evaluate for
-  an address (`GEOIP`, `IP-ASN`, `mrs` sets) are skipped. A query that fails
+  resolver LAN clients use). Every global unicast address is taken (like
+  ShellCrash's node bypass), so a node that moves to a new address is
+  followed at the next lookup. With `node_bypass` off nothing is looked up
+  and node addresses stay in the TUN like other traffic; leftover rules are
+  removed on the next check. (Off used to keep the addresses the rules send
+  DIRECT by IP; that mode was dropped on 2026-11-16, see devices past the
+  TUN below.) Changing it needs no mihomo reload. A query that fails
   (controller error or any status but NOERROR) keeps that name's addresses
   from the previous lookup, and the lookup is retried after 30 s. The
   addresses go into `mihomo-relay`/`mihomo-relay6`, which get the mainland
@@ -212,6 +212,20 @@ release, GitHub SHA-256 verified on both ends).
   status is the number of addresses sent past the TUN. The setting is
   written to `manager.json` only when off, so an older agent still reads the
   file.
+- **Devices past the TUN** (`settings.bypass_macs`, a list of MAC addresses,
+  at most 32, normalized to `AA:BB:CC:DD:EE:FF`): everything those LAN
+  devices send skips the TUN, IPv4 and IPv6, as if no proxy ran. Meant for
+  devices that run their own proxy client (Surge on a Mac), which a mihomo
+  reload, restart or stuck flow would otherwise cut off. One `hash:mac` set
+  (`mihomo-direct-mac`, matched by source, both families) gets the bypass
+  mark and shares ip rule 8999; their IPv6 returns before the notrack.
+  Changing the list rewrites only these rules (no config render, no mihomo
+  reload); devices newly added have their connections through mihomo closed
+  (addresses from the br-lan neighbour table), so their apps reconnect on
+  the direct path at once. DNS sent to the router (192.168.0.1) is still
+  answered by dnsmasq through mihomo's resolver (real IPs). Status reports
+  `bypass_macs` and `bypass_macs_active` (rules in place for exactly that
+  list). Written to `manager.json` only when non-empty.
 - **IPv6 and IPA offload**: ipacm offloads established IPv6 flows by their
   conntrack tuple (`IPv6CTEnabled` in `/etc/data/ipa/IPACM_cfg.xml`). A LAN
   flow routed into the TUN looks forwarded, so about 250 ms in the client's
@@ -230,14 +244,14 @@ release, GitHub SHA-256 verified on both ends).
   Alternatives tested and rejected: TProxy (with `bridge-nf-call-ip6tables=1`
   the IPv6 stack drops the socket TPROXY assigned, so connections land on
   uhttpd's `:443` or nowhere) and REDIRECT (works for IPv4, but its NAT'd IPv6
-  flows were offloaded the same way, and NAT cannot be untracked). The relay
-  itself is not the agent's: `scripts/device/net-time-guard.sh` keeps odhcpd
-  relaying RA/DHCPv6, routes the WAN /64 on-link to `br-lan`, keeps NDP
-  relay off on the raw-IP WAN, where odhcpd used to route LAN clients out
-  the WAN, and sends odhcpd SIGHUP when the /64 changes and every 5 minutes.
-  The carrier answers odhcpd's RS but sent no unsolicited RA in any capture,
-  so without this a client that missed the RA for a new prefix had no global
-  IPv6 at all (2026-11-15).
+  flows were offloaded the same way, and NAT cannot be untracked). Since
+  2026-11-16 the LAN has no global IPv6 at all (the user's choice):
+  `scripts/device/net-time-guard.sh` keeps odhcpd's RA, DHCPv6 and NDP relay
+  disabled on `lan`, so these rules match nothing. They stay for a LAN that
+  gets IPv6 again. Before that the guard relayed the carrier's RA to the LAN,
+  routed the WAN /64 on-link to `br-lan` and re-solicited the RA after every
+  prefix change, and clients were still left on dead prefixes after WAN
+  reconnects.
 - **Forwarding watchdog**: every 60 s a mainland 204 endpoint is fetched
   through the mixed port (and directly when that fails, to rule out a WAN
   outage). Three failures through mihomo restart it; if it still does not

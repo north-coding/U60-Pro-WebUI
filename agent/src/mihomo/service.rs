@@ -309,6 +309,7 @@ pub fn firewall_present_in(s: &RuleState) -> bool {
             raw.has(&notrack_rule())
                 && cn6_bypassing_in(s) == raw.has(&cn6_return_rule())
                 && relay6_bypassing_in(s) == raw.has(&return_rule(RELAY6_SET))
+                && macs6_bypassing_in(s) == raw.has(&mac_return_rule())
                 && notrack_jumps().iter().all(|rule| raw.has(rule))
         })
     } else {
@@ -339,6 +340,7 @@ pub fn firewall_add() -> Result<(), String> {
 pub fn firewall_remove() {
     bypass_remove();
     relay_remove();
+    macs_remove();
     notrack_remove();
     for bin in ["iptables", "ip6tables"] {
         for rule in fw_rules() {
@@ -367,8 +369,9 @@ pub fn firewall_remove() {
 // untracked; the accepts above are stateless, so they still pass. Without the
 // TUN routing IPv6 these rules would leave WAN replies NEW for fw3 to reject,
 // so they exist only while sing-tun's IPv6 rules do. Mainland IPv6 that the
-// bypass sends past the TUN, and IPv6 to proxy servers sent past it (see
-// relay_add), return early and stay tracked and offloaded.
+// bypass sends past the TUN, IPv6 to proxy servers sent past it (see
+// relay_add) and IPv6 from direct devices (macs_add) return early and stay
+// tracked and offloaded.
 
 const NOTRACK_CHAIN: &str = "mihomo_notrack";
 const GLOBAL_V6: &str = "2000::/3";
@@ -438,13 +441,19 @@ fn cn6_return_rule() -> Vec<&'static str> {
 
 /// The notrack chain's early return for destinations in `set`.
 fn return_rule(set: &'static str) -> Vec<&'static str> {
+    set_return_rule(set, "dst")
+}
+
+/// The notrack chain's early return for packets whose `dir` (`src`/`dst`)
+/// is in `set`.
+fn set_return_rule(set: &'static str, dir: &'static str) -> Vec<&'static str> {
     vec![
         NOTRACK_CHAIN,
         "-m",
         "set",
         "--match-set",
         set,
-        "dst",
+        dir,
         "-j",
         "RETURN",
     ]
@@ -452,7 +461,11 @@ fn return_rule(set: &'static str) -> Vec<&'static str> {
 
 /// Insert (`on`) or remove the notrack chain's early return for `set`.
 fn sync_return(set: &'static str, on: bool) -> bool {
-    let rule = return_rule(set);
+    sync_return_rule(return_rule(set), on)
+}
+
+/// Insert (`on`) or remove one early return of the notrack chain.
+fn sync_return_rule(rule: Vec<&'static str>, on: bool) -> bool {
     if on {
         return raw6("-C", &rule) || raw6("-I", &rule);
     }
@@ -498,14 +511,17 @@ fn notrack_add() -> Result<(), String> {
             "ip6tables: could not create the {NOTRACK_CHAIN} chain"
         ));
     }
-    // While mainland IPv6 or proxy servers' IPv6 bypass the TUN, their early
-    // returns must precede the notrack (rebuilt here after a flush);
-    // otherwise they must not be there.
+    // While mainland IPv6, proxy servers' IPv6 or direct devices bypass the
+    // TUN, their early returns must precede the notrack (rebuilt here after a
+    // flush); otherwise they must not be there.
     if !sync_return(CN6_SET, cn6_bypassing()) {
         return Err("ip6tables: could not insert the mainland IPv6 return".into());
     }
     if !sync_return(RELAY6_SET, relay6_bypassing()) {
         return Err("ip6tables: could not insert the proxy servers' IPv6 return".into());
+    }
+    if !sync_return_rule(mac_return_rule(), macs6_bypassing()) {
+        return Err("ip6tables: could not insert the direct devices' IPv6 return".into());
     }
     if !raw6("-C", &notrack_rule()) && !raw6("-A", &notrack_rule()) {
         return Err("ip6tables: could not add the IPv6 notrack rule".into());
@@ -1026,10 +1042,18 @@ fn bypass_route_add(f: &Family) -> bool {
             .unwrap_or(false)
 }
 
-/// Remove that ip rule unless the mark rule for `other` (the other user of
-/// it) is still in place.
-fn bypass_route_drop_unless(f: &Family, other: &'static str) {
-    if mangle_rule(f, "-C", &set_mark_rule(other)) {
+/// The family's mark rules that send packets through that ip rule: the
+/// mainland bypass, the proxy servers' and the direct devices'.
+fn route_users() -> [fn(&Family) -> Vec<&'static str>; 3] {
+    [mark_rule, |f| set_mark_rule(f.relay), |_| mac_mark_rule()]
+}
+
+/// Remove that ip rule unless a mark rule still uses it.
+fn bypass_route_release(f: &Family) {
+    if route_users()
+        .iter()
+        .any(|rule| mangle_rule(f, "-C", &rule(f)))
+    {
         return;
     }
     for _ in 0..8 {
@@ -1053,7 +1077,7 @@ pub fn bypass_remove() {
                 break;
             }
         }
-        bypass_route_drop_unless(f, f.relay);
+        bypass_route_release(f);
     }
     for _ in 0..8 {
         if !raw6("-D", &cn6_return_rule()) {
@@ -1154,7 +1178,7 @@ pub fn relay_remove() {
                 break;
             }
         }
-        bypass_route_drop_unless(f, f.set);
+        bypass_route_release(f);
     }
     sync_return(RELAY6_SET, false);
     for f in &FAMILIES {
@@ -1162,6 +1186,169 @@ pub fn relay_remove() {
             .args(["destroy", f.relay])
             .bounded_output();
     }
+}
+
+// ── Direct devices past the TUN ──────────────────────────────────────────────
+//
+// LAN devices chosen by MAC address (settings.bypass_macs) skip the TUN
+// altogether: everything they send gets the mainland bypass's mark from one
+// hash:mac set (it serves both families), so the shared ip rule routes it
+// through the main table — kernel NAT, IPA offload, no mihomo. Devices that
+// run their own proxy client (Surge on the Mac) then see the real network,
+// and a mihomo reload or restart no longer cuts them off. Their IPv6 returns
+// before the notrack and stays tracked. Same order as the other bypasses:
+// set, then the return, then marks and the ip rule.
+
+const MAC_SET: &str = "mihomo-direct-mac";
+
+/// `[chain, spec...]` of the mark rule for LAN packets from direct devices.
+fn mac_mark_rule() -> Vec<&'static str> {
+    vec![
+        "PREROUTING",
+        "-i",
+        LAN_BRIDGE,
+        "-m",
+        "set",
+        "--match-set",
+        MAC_SET,
+        "src",
+        "-m",
+        "comment",
+        "--comment",
+        FW_COMMENT,
+        "-j",
+        "MARK",
+        "--set-xmark",
+        BYPASS_MARK,
+    ]
+}
+
+fn mac_return_rule() -> Vec<&'static str> {
+    set_return_rule(MAC_SET, "src")
+}
+
+/// Direct devices' IPv6 is being sent past the TUN.
+fn macs6_bypassing() -> bool {
+    mangle_rule(V6, "-C", &mac_mark_rule())
+}
+
+fn macs6_bypassing_in(s: &RuleState) -> bool {
+    s.mangle(V6.iptables)
+        .is_some_and(|l| l.has(&mac_mark_rule()))
+}
+
+/// Make the direct devices' set hold exactly `macs` and put the rules in
+/// place.
+pub fn macs_add(macs: &[String]) -> Result<(), String> {
+    // Settings are validated; this keeps anything else out of the script.
+    if let Some(bad) = macs
+        .iter()
+        .find(|m| crate::clients::normalize_mac(m).as_deref() != Some(m.as_str()))
+    {
+        return Err(format!("not a MAC address: {bad:?}"));
+    }
+    let mut script = format!("create {MAC_SET} hash:mac -exist\nflush {MAC_SET}\n");
+    for mac in macs {
+        script.push_str(&format!("add {MAC_SET} {mac} -exist\n"));
+    }
+    let out = process_runner::output(
+        Command::new("ipset").arg("restore"),
+        Some(script.as_bytes()),
+        Duration::from_secs(10),
+        64 * 1024,
+    )
+    .map_err(|e| format!("ipset restore: {e}"))?;
+    if !out.status.success() {
+        return Err(format!(
+            "ipset restore: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
+    }
+    if notrack_chain_exists() && !sync_return_rule(mac_return_rule(), true) {
+        return Err("ip6tables: could not insert the direct devices' IPv6 return".into());
+    }
+    for f in &FAMILIES {
+        let rule = mac_mark_rule();
+        if !mangle_rule(f, "-C", &rule) && !mangle_rule(f, "-I", &rule) {
+            return Err(format!(
+                "{}: could not insert the direct devices' mark rule",
+                f.iptables
+            ));
+        }
+        if !bypass_route_add(f) {
+            return Err(format!("ip rule: could not add the {} bypass rule", f.name));
+        }
+    }
+    Ok(())
+}
+
+/// Everything [`macs_add`] puts in place, against one read of the rule state
+/// (set contents are not compared).
+pub fn macs_present_in(s: &RuleState) -> bool {
+    s.sets()
+        .is_some_and(|sets| sets.iter().any(|n| n == MAC_SET))
+        && FAMILIES.iter().all(|f| {
+            s.mangle(f.iptables)
+                .is_some_and(|l| l.has(&mac_mark_rule()))
+                && has_pref(s.ip_rules(f.ip), BYPASS_PREF)
+        })
+        && s.raw6()
+            .is_none_or(|raw| !raw.has_chain(NOTRACK_CHAIN) || raw.has(&mac_return_rule()))
+}
+
+/// The set exists (an earlier agent may have left the rules), against one
+/// read of the rule state.
+pub fn macs_in_place_in(s: &RuleState) -> bool {
+    s.sets()
+        .is_some_and(|sets| sets.iter().any(|n| n == MAC_SET))
+}
+
+/// Marks first, then the ip rule unless another bypass still uses it, then
+/// the IPv6 return, then the set.
+pub fn macs_remove() {
+    for f in &FAMILIES {
+        let rule = mac_mark_rule();
+        for _ in 0..8 {
+            if !mangle_rule(f, "-D", &rule) {
+                break;
+            }
+        }
+        bypass_route_release(f);
+    }
+    sync_return_rule(mac_return_rule(), false);
+    let _ = Command::new("ipset")
+        .args(["destroy", MAC_SET])
+        .bounded_output();
+}
+
+/// The LAN addresses (IPv4 and IPv6) the neighbour tables hold for `macs`,
+/// so connections they already have through mihomo can be closed.
+pub fn lan_addresses_of(macs: &[String]) -> Vec<std::net::IpAddr> {
+    let listing = Command::new("ip")
+        .args(["neigh", "show", "dev", LAN_BRIDGE])
+        .bounded_output()
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default();
+    addresses_in_neigh(&listing, macs)
+}
+
+/// `ip neigh show dev …` lines (`ADDR lladdr MAC STATE`) whose MAC is in
+/// `macs` (compared case-insensitively).
+fn addresses_in_neigh(listing: &str, macs: &[String]) -> Vec<std::net::IpAddr> {
+    let mut out = Vec::new();
+    for line in listing.lines() {
+        let words: Vec<&str> = line.split_whitespace().collect();
+        let Some(addr) = words.first().and_then(|w| w.parse().ok()) else {
+            continue;
+        };
+        let mac = words.windows(2).find(|w| w[0] == "lladdr").map(|w| w[1]);
+        if mac.is_some_and(|m| macs.iter().any(|x| x.eq_ignore_ascii_case(m)))
+            && !out.contains(&addr)
+        {
+            out.push(addr);
+        }
+    }
+    out
 }
 
 /// Does mihomo's LAN controller at `addr` accept `secret`? `None` when it
@@ -1561,6 +1748,51 @@ mod tests {
         );
         assert!(listed.has(&mark_rule(v4)));
         assert!(!listed.has(&mark_rule(V6)), "the v6 rule names another set");
+    }
+
+    #[test]
+    fn listing_matches_the_direct_devices_rules_as_iptables_saves_them() {
+        let mangle = Listing::parse(
+            "-P PREROUTING ACCEPT\n\
+             -A PREROUTING -i br-lan -m set --match-set mihomo-direct-mac src -m comment --comment mihomo-tun -j MARK --set-xmark 0x10000000/0x10000000\n\
+             -A PREROUTING -i br-lan -m set --match-set mihomo-relay dst -m comment --comment mihomo-tun -j MARK --set-xmark 0x10000000/0x10000000\n",
+        );
+        assert!(mangle.has(&mac_mark_rule()));
+        assert!(mangle.has(&set_mark_rule(RELAY_SET)));
+        let raw = Listing::parse(
+            "-N mihomo_notrack\n\
+             -A mihomo_notrack -m set --match-set mihomo-direct-mac src -j RETURN\n\
+             -A mihomo_notrack -j CT --notrack\n",
+        );
+        assert!(raw.has(&mac_return_rule()));
+        assert!(raw.has(&notrack_rule()));
+        // The same set matched by destination is another rule.
+        let dst = Listing::parse(
+            "-A mihomo_notrack -m set --match-set mihomo-direct-mac dst -j RETURN\n",
+        );
+        assert!(!dst.has(&mac_return_rule()));
+        // Each bypass keeps the shared ip rule alive.
+        let users: Vec<Vec<&str>> = route_users().iter().map(|r| r(V6)).collect();
+        assert!(users.contains(&mark_rule(V6)));
+        assert!(users.contains(&set_mark_rule(RELAY6_SET)));
+        assert!(users.contains(&mac_mark_rule()));
+    }
+
+    #[test]
+    fn direct_devices_addresses_come_from_the_neighbour_table() {
+        let listing = "192.0.2.10 lladdr 02:00:00:00:00:0a REACHABLE\n\
+                       192.0.2.11 lladdr 02:00:00:00:00:0b STALE\n\
+                       192.0.2.12  FAILED\n\
+                       fe80::a lladdr 02:00:00:00:00:0a REACHABLE\n\
+                       2001:db8::a lladdr 02:00:00:00:00:0A DELAY\n\
+                       2001:db8::a lladdr 02:00:00:00:00:0a REACHABLE\n";
+        let macs = vec!["02:00:00:00:00:0A".to_string()];
+        let found: Vec<String> = addresses_in_neigh(listing, &macs)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(found, ["192.0.2.10", "fe80::a", "2001:db8::a"]);
+        assert!(addresses_in_neigh(listing, &[]).is_empty());
     }
 
     #[test]

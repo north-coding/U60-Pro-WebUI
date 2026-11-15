@@ -1894,6 +1894,7 @@ def proxy_defaults():
         "tun": False,
         "cn_bypass": True,
         "node_bypass": True,
+        "bypass_macs": ["00:00:5E:00:53:01"],
         "mixed_port": 7890,
         "profile": "a1b2c3d4",
         "now": {"PROXY": "AUTO", "节点选择": "自动选择", "国外媒体": "节点选择", "苹果服务": "直接连接",
@@ -1963,6 +1964,8 @@ def proxy_status():
         "cn_bypass": p["cn_bypass"], "cn_bypass_active": p["tun"] and running and p["cn_bypass"],
         "cn_bypass_available": True,
         "node_bypass": p["node_bypass"], "node_bypass_count": 9 if p["tun"] and running else 0,
+        "bypass_macs": list(p["bypass_macs"]),
+        "bypass_macs_active": bool(p["bypass_macs"]) and p["tun"] and running,
         "proxy_address": f"192.168.0.1:{p['mixed_port']}", "pac_url": "http://192.168.0.1:9090/proxy.pac",
         "subscriptions": len(p["subs"]),
         "traffic": {"up_total": 182_000_000, "down_total": 4_310_000_000,
@@ -1989,6 +1992,18 @@ def put_proxy_settings(body):
             p["cn_bypass"] = value
         elif key == "node_bypass" and isinstance(value, bool):
             p["node_bypass"] = value
+        elif key == "bypass_macs" and isinstance(value, list):
+            macs = []
+            for item in value:
+                hexed = item.replace("-", "").replace(":", "") if isinstance(item, str) else ""
+                if len(hexed) != 12 or any(c not in "0123456789abcdefABCDEF" for c in hexed) or int(hexed[:2], 16) & 1:
+                    raise ApiError(400, "bypass_macs must be a list of device MAC addresses")
+                mac = ":".join(hexed[i:i + 2] for i in range(0, 12, 2)).upper()
+                if mac not in macs:
+                    macs.append(mac)
+            if len(macs) > 32:
+                raise ApiError(400, "at most 32 devices can bypass the proxy")
+            p["bypass_macs"] = macs
         elif key == "mixed_port" and _is_int(value) and 1024 <= value <= 65535 and value not in (2222, 8080, 9090, 9097):
             p["mixed_port"] = value
         else:

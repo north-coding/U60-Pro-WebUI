@@ -97,6 +97,11 @@ struct Inner {
     relay_cache: relay::Cache,
     /// The last lookup was incomplete: retry soon.
     relay_incomplete: bool,
+    /// Devices (MAC addresses) whose traffic is sent past the TUN, as last
+    /// put in place.
+    macs_applied: Vec<String>,
+    /// Rules a previous agent left were looked for (once per agent start).
+    macs_leftover_checked: bool,
 }
 
 /// Is mihomo still forwarding? (A live process can hang with the TUN up,
@@ -265,6 +270,8 @@ impl Manager {
                 relay_config: None,
                 relay_cache: relay::Cache::new(),
                 relay_incomplete: false,
+                macs_applied: Vec::new(),
+                macs_leftover_checked: false,
             }),
         }
     }
@@ -311,8 +318,8 @@ impl Manager {
                 }
                 // Lookups go through the controller: not under the lock.
                 let relay_due = me.lock().relay_due();
-                if let Some((config, all, cache)) = relay_due {
-                    let found = relay::find(&config, Path::new(service::DIR), all, &cache);
+                if let Some((config, cache)) = relay_due {
+                    let found = relay::find(&config, Path::new(service::DIR), &cache);
                     me.lock().relay_result(found);
                 }
                 let profile_due = me.lock().profile_due();
@@ -600,6 +607,7 @@ impl Inner {
             service::firewall_remove();
             service::cleanup_routing();
             dns_forward_off();
+            self.macs_applied.clear();
         }
         while self
             .crashes
@@ -658,6 +666,7 @@ impl Inner {
             }
             self.sync_bypass(&rules);
             self.sync_relay(&rules);
+            self.sync_macs(&rules);
             self.sync_dns();
         } else if !(self.state.settings.tun && self.alive()) {
             // Idempotent: also keeps dnsmasq on the carrier's current resolvers.
@@ -729,7 +738,9 @@ impl Inner {
     /// The live config when the proxy servers sent past the TUN are due to be
     /// looked up again: TUN running and RELAY_EVERY passed (RELAY_RETRY after
     /// an incomplete lookup), or the config file changed.
-    fn relay_due(&mut self) -> Option<(Value, bool, relay::Cache)> {
+    /// With `node_bypass` off nothing is looked up: the result is no
+    /// addresses, which removes rules this or an earlier agent left.
+    fn relay_due(&mut self) -> Option<(Value, relay::Cache)> {
         if !(self.state.settings.tun && self.alive()) {
             return None;
         }
@@ -748,14 +759,18 @@ impl Inner {
         }
         self.relay_checked = Some(Instant::now());
         self.relay_config = modified;
+        if !self.state.settings.node_bypass {
+            self.relay_result(relay::Found {
+                addresses: Vec::new(),
+                cache: relay::Cache::new(),
+                complete: true,
+            });
+            return None;
+        }
         let config = fs::read(service::CONFIG)
             .ok()
             .and_then(|b| serde_json::from_slice(&b).ok())?;
-        Some((
-            config,
-            self.state.settings.node_bypass,
-            self.relay_cache.clone(),
-        ))
+        Some((config, self.relay_cache.clone()))
     }
 
     /// Bring the proxy servers' bypass in line with a lookup.
@@ -807,6 +822,63 @@ impl Inner {
             Err(e) => {
                 eprintln!("[mihomo] restoring the proxy servers' bypass failed: {e}");
                 self.last_error = Some(format!("proxy servers past the TUN: {e}"));
+            }
+        }
+    }
+
+    /// Bring the direct devices (settings.bypass_macs) in line: their traffic
+    /// skips the TUN while it runs. A device that was not past the TUN yet
+    /// has its connections through mihomo closed, so its apps reconnect on
+    /// the direct path at once instead of waiting on dead flows.
+    fn sync_macs(&mut self, rules: &service::RuleState) {
+        let want = if self.state.settings.tun && self.alive() {
+            self.state.settings.bypass_macs.clone()
+        } else {
+            Vec::new()
+        };
+        if want.is_empty() {
+            // Look for a previous agent's rules once; after that only what
+            // this agent put in place can be there.
+            let leftover = !self.macs_leftover_checked && service::macs_in_place_in(rules);
+            self.macs_leftover_checked = true;
+            if !self.macs_applied.is_empty() || leftover {
+                service::macs_remove();
+                eprintln!("[mihomo] no LAN device sent past the TUN");
+            }
+            self.macs_applied.clear();
+            return;
+        }
+        if want == self.macs_applied && service::macs_present_in(rules) {
+            return;
+        }
+        match service::macs_add(&want) {
+            Ok(()) => {
+                let added: Vec<String> = want
+                    .iter()
+                    .filter(|m| !self.macs_applied.contains(m))
+                    .cloned()
+                    .collect();
+                let closed = if added.is_empty() {
+                    0
+                } else {
+                    close_connections_from(&service::lan_addresses_of(&added))
+                };
+                eprintln!(
+                    "[mihomo] {} LAN device(s) sent past the TUN{}",
+                    want.len(),
+                    if closed > 0 {
+                        format!("; closed {closed} of their connection(s) through mihomo")
+                    } else {
+                        String::new()
+                    }
+                );
+                self.macs_applied = want;
+            }
+            Err(e) => {
+                eprintln!("[mihomo] sending LAN devices past the TUN failed: {e}");
+                self.last_error = Some(format!("devices past the TUN: {e}"));
+                service::macs_remove();
+                self.macs_applied.clear();
             }
         }
     }
@@ -878,6 +950,7 @@ impl Inner {
             self.firewall_checked = None;
         }
         self.sync_bypass(&service::RuleState::new());
+        self.sync_macs(&service::RuleState::new());
         // A new process: look the proxy servers up again on the next tick.
         self.relay_checked = None;
         if self.version.is_none() {
@@ -896,6 +969,7 @@ impl Inner {
         dns_forward_off();
         self.traffic = None;
         self.bypass_active = false;
+        self.macs_applied.clear();
     }
 
     fn restart(&mut self) -> Result<(), String> {
@@ -947,6 +1021,7 @@ impl Inner {
         }
         self.notice = None;
         self.sync_bypass(&service::RuleState::new());
+        self.sync_macs(&service::RuleState::new());
         Ok(())
     }
 
@@ -1031,6 +1106,8 @@ impl Inner {
             "cn_bypass_available": service::bypass_available(),
             "node_bypass": s.node_bypass,
             "node_bypass_count": self.relay.len(),
+            "bypass_macs": s.bypass_macs,
+            "bypass_macs_active": !s.bypass_macs.is_empty() && self.macs_applied == s.bypass_macs,
             "mixed_port": s.mixed_port,
             "lan_ip": ip,
             "proxy_address": ip.as_ref().map(|ip| format!("{ip}:{}", s.mixed_port)),
@@ -1049,6 +1126,48 @@ impl Inner {
             "notice": self.notice,
         })
     }
+}
+
+/// Close mihomo's connections from `addrs`; returns how many were closed.
+fn close_connections_from(addrs: &[std::net::IpAddr]) -> usize {
+    if addrs.is_empty() {
+        return 0;
+    }
+    let Ok(listing) = Controller.get("/connections") else {
+        return 0;
+    };
+    let ids = connection_ids_from(&listing, addrs);
+    ids.iter()
+        .filter(|id| {
+            Controller
+                .request(
+                    "DELETE",
+                    &format!("/connections/{}", segment(id)),
+                    None,
+                    Duration::from_secs(2),
+                )
+                .is_ok_and(|r| r.ok())
+        })
+        .count()
+}
+
+/// Ids of the connections in a `/connections` listing whose source is one of
+/// `addrs`.
+fn connection_ids_from(listing: &Value, addrs: &[std::net::IpAddr]) -> Vec<String> {
+    listing["connections"]
+        .as_array()
+        .map(|list| {
+            list.iter()
+                .filter(|c| {
+                    c["metadata"]["sourceIP"]
+                        .as_str()
+                        .and_then(|ip| ip.parse::<std::net::IpAddr>().ok())
+                        .is_some_and(|ip| addrs.contains(&ip))
+                })
+                .filter_map(|c| c["id"].as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Hand LAN DNS back to dnsmasq's own resolvers; failures are only logged.
@@ -1181,6 +1300,9 @@ impl Manager {
             config::validate_url(&sub.url)?;
         }
         config::validate_port(u64::from(next.settings.mixed_port))?;
+        // They end up in an ipset script: only well-formed MAC addresses.
+        next.settings.bypass_macs =
+            config::validate_bypass_macs(&json!(next.settings.bypass_macs))?;
         let mut warning = None;
         let profile_sub = next
             .settings
@@ -1227,7 +1349,8 @@ impl Manager {
         (200, json!({"ok": true, "data": inner.status()}))
     }
 
-    /// PUT /api/proxy/settings — {mode?, preset?, tun?, mixed_port?}
+    /// PUT /api/proxy/settings — {mode?, preset?, tun?, cn_bypass?,
+    /// node_bypass?, bypass_macs?, mixed_port?}
     pub fn settings_set(&self, body: &[u8]) -> (u16, Value) {
         let v = match parse(body) {
             Ok(v) => v,
@@ -1242,6 +1365,7 @@ impl Manager {
                 "tun",
                 "cn_bypass",
                 "node_bypass",
+                "bypass_macs",
                 "mixed_port",
             ]
             .contains(&key.as_str())
@@ -1279,6 +1403,12 @@ impl Manager {
                 None => return bad("node_bypass must be a boolean"),
             }
         }
+        if let Some(m) = v.get("bypass_macs") {
+            match config::validate_bypass_macs(m) {
+                Ok(m) => next.settings.bypass_macs = m,
+                Err(e) => return bad(e),
+            }
+        }
         if let Some(p) = v.get("mixed_port") {
             match p
                 .as_u64()
@@ -1290,6 +1420,25 @@ impl Manager {
             }
         }
         if next == inner.state {
+            return (200, json!({"ok": true, "data": inner.status()}));
+        }
+        // The devices and node addresses past the TUN are firewall rules
+        // only: no new config, no reload (which would drop every TUN
+        // connection).
+        let mut same_config = next.clone();
+        same_config.settings.bypass_macs = inner.state.settings.bypass_macs.clone();
+        same_config.settings.node_bypass = inner.state.settings.node_bypass;
+        if same_config == inner.state {
+            if let Err(e) = save_state(&next) {
+                return conflict(e);
+            }
+            let nodes_changed = next.settings.node_bypass != inner.state.settings.node_bypass;
+            inner.state = next;
+            inner.sync_macs(&service::RuleState::new());
+            if nodes_changed {
+                // Looked up (or removed) on the next tick.
+                inner.relay_checked = None;
+            }
             return (200, json!({"ok": true, "data": inner.status()}));
         }
         match inner.apply(next) {
@@ -1884,9 +2033,29 @@ mod tests {
                     relay_config: None,
                     relay_cache: relay::Cache::new(),
                     relay_incomplete: false,
+                    macs_applied: Vec::new(),
+                    macs_leftover_checked: false,
                 }),
             }
         }
+    }
+
+    #[test]
+    fn direct_devices_connections_are_picked_by_source() {
+        let listing = json!({"connections": [
+            {"id": "a", "metadata": {"sourceIP": "192.0.2.10"}},
+            {"id": "b", "metadata": {"sourceIP": "192.0.2.11"}},
+            {"id": "c", "metadata": {"sourceIP": "2001:db8::a"}},
+            {"id": "d", "metadata": {"sourceIP": ""}},
+            {"metadata": {"sourceIP": "192.0.2.10"}},
+        ]});
+        let addrs: Vec<std::net::IpAddr> = vec![
+            "192.0.2.10".parse().unwrap(),
+            "2001:db8::a".parse().unwrap(),
+        ];
+        assert_eq!(connection_ids_from(&listing, &addrs), ["a", "c"]);
+        assert!(connection_ids_from(&json!({}), &addrs).is_empty());
+        assert!(connection_ids_from(&listing, &[]).is_empty());
     }
 
     fn sample() -> Value {
