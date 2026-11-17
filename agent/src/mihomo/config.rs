@@ -269,6 +269,118 @@ pub fn render(
     Ok(config)
 }
 
+/// Render an offline preview for a future isolated mihomo instance.
+///
+/// This function only builds an in-memory value. The resulting config is a
+/// PREVIEW ONLY and is NOT AUTHORIZED TO RUN ON U60 until network and
+/// isolation safety are reviewed: mihomo may still fetch enabled providers
+/// when started, even with provider interval set to zero.
+#[allow(dead_code)] // G1-D preview is deliberately not wired to any running service yet.
+pub fn render_isolated_preview(state: &State) -> Result<Value, String> {
+    if state.settings.profile.is_some() {
+        return Err("isolated preview does not support profile mode".into());
+    }
+    if state.settings.tun {
+        return Err("isolated preview does not support TUN mode".into());
+    }
+
+    if state.subscriptions.len() > MAX_SUBSCRIPTIONS {
+        return Err("too many subscriptions for isolated preview".into());
+    }
+    let mut ids = std::collections::HashSet::new();
+    for sub in &state.subscriptions {
+        if sub.id.len() != 8 || !sub.id.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("subscription id must be exactly 8 ASCII hexadecimal characters".into());
+        }
+        if !ids.insert(sub.id.to_ascii_lowercase()) {
+            return Err("duplicate subscription id".into());
+        }
+        validate_name(&sub.name).map_err(|error| format!("subscription {}: {error}", sub.id))?;
+        validate_url(&sub.url).map_err(|error| format!("subscription {}: {error}", sub.id))?;
+        validate_interval(u64::from(sub.interval_hours))
+            .map_err(|error| format!("subscription {}: {error}", sub.id))?;
+    }
+
+    // Reuse the existing managed config and its subscription/group/rule
+    // generation, then apply only the isolated preview's safety overrides.
+    let mut config = render(state, "127.0.0.1", None, false)?;
+    let obj = config
+        .as_object_mut()
+        .ok_or("managed config is not a mapping")?;
+
+    obj.insert("mixed-port".into(), json!(17890));
+    obj.insert("allow-lan".into(), json!(false));
+    obj.insert("bind-address".into(), json!("127.0.0.1"));
+    obj.remove("external-controller");
+    obj.insert(
+        "external-controller-unix".into(),
+        json!("/data/u60-webui-isolated/runtime/mihomo.sock"),
+    );
+
+    // Keep this preview free of public listeners, UI downloads, and any
+    // transparent-routing or firewall configuration if the shared renderer
+    // grows additional runtime fields later.
+    for key in [
+        "port",
+        "socks-port",
+        "redir-port",
+        "tproxy-port",
+        "listeners",
+        "tunnels",
+        "external-controller-tls",
+        "external-controller-pipe",
+        "external-controller-cors",
+        "external-ui",
+        "external-ui-url",
+        "external-ui-name",
+        "external-doh-server",
+        "tun",
+        "iptables",
+        "ebpf",
+        "auto-redir",
+        "auto-route",
+        "auto-detect-interface",
+        "route-exclude-address",
+        "interface-name",
+        "routing-mark",
+    ] {
+        obj.remove(key);
+    }
+
+    if let Some(dns) = obj.get_mut("dns").and_then(Value::as_object_mut) {
+        dns.insert("enable".into(), json!(false));
+        dns.remove("listen");
+    }
+    obj.insert("geo-auto-update".into(), json!(false));
+    // The preview must not poll NTP or persist group selection if ever examined.
+    obj.insert(
+        "ntp".into(),
+        json!({"enable": false, "write-to-system": false}),
+    );
+    obj.insert("profile".into(), json!({"store-selected": false}));
+
+    let providers = obj
+        .get_mut("proxy-providers")
+        .and_then(Value::as_object_mut)
+        .ok_or("managed config has no proxy-providers mapping")?;
+    for provider in providers.values_mut() {
+        let provider = provider
+            .as_object_mut()
+            .ok_or("managed proxy provider is not a mapping")?;
+        provider.insert("interval".into(), json!(0));
+        let health_check = provider.entry("health-check").or_insert_with(|| json!({}));
+        if !health_check.is_object() {
+            *health_check = json!({});
+        }
+        health_check
+            .as_object_mut()
+            .expect("health-check was made an object")
+            .insert("enable".into(), json!(false));
+    }
+
+    Ok(config)
+}
+
 /// The controller secret a subscription config sets ("" when none).
 pub fn profile_secret(base: &Value) -> String {
     match base.get("secret") {
@@ -469,6 +581,183 @@ fn apply_runtime(config: &mut Value, state: &State, lan_ip: &str, secret: &str, 
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod isolated_preview_tests {
+    use super::*;
+
+    fn subscription(id: &str, enabled: bool) -> Subscription {
+        Subscription {
+            id: id.into(),
+            name: format!("Provider {id}"),
+            url: format!("https://provider.example/sub/{id}?token=synthetic"),
+            enabled,
+            interval_hours: 24,
+            fetched: None,
+        }
+    }
+
+    #[test]
+    fn preview_is_loopback_only_and_reuses_existing_managed_subscriptions() {
+        let state = State {
+            settings: Settings {
+                enabled: true,
+                mixed_port: DEFAULT_PORT,
+                preset: Preset::BypassCn,
+                ..Default::default()
+            },
+            subscriptions: vec![
+                subscription("0123abcd", true),
+                subscription("abcd1234", false),
+            ],
+            ..Default::default()
+        };
+        let original = state.clone();
+        let preview = render_isolated_preview(&state).expect("valid isolated config");
+        assert_eq!(state, original, "pure preview must not mutate the input");
+        assert_eq!(preview["mixed-port"], 17890);
+        assert_eq!(preview["allow-lan"], false);
+        assert_eq!(preview["bind-address"], "127.0.0.1");
+        assert!(preview.get("external-controller").is_none());
+        assert_eq!(
+            preview["external-controller-unix"],
+            "/data/u60-webui-isolated/runtime/mihomo.sock"
+        );
+        assert_eq!(preview["ntp"]["enable"], false);
+        assert_eq!(preview["ntp"]["write-to-system"], false);
+        assert_eq!(preview["profile"]["store-selected"], false);
+        assert_eq!(preview["geo-auto-update"], false);
+        assert_eq!(preview["dns"]["enable"], false);
+        assert!(preview["dns"].get("listen").is_none());
+        assert_eq!(preview["proxy-groups"][0]["use"], json!(["sub-0123abcd"]));
+        assert_eq!(
+            preview["rules"].as_array().and_then(|rules| rules.last()),
+            Some(&json!("MATCH,PROXY"))
+        );
+        assert_eq!(preview["proxy-providers"].as_object().unwrap().len(), 1);
+        let enabled = &preview["proxy-providers"]["sub-0123abcd"];
+        assert_eq!(enabled["interval"], 0);
+        assert_eq!(enabled["health-check"]["enable"], false);
+        assert_eq!(enabled["path"], "./providers/sub-0123abcd.yaml");
+        assert_eq!(
+            enabled["url"],
+            "https://provider.example/sub/0123abcd?token=synthetic"
+        );
+        assert!(preview["proxy-providers"].get("sub-abcd1234").is_none());
+
+        let text = serde_json::to_string(&preview).unwrap();
+        assert!(!text.contains("/data/mihomo"));
+        for key in [
+            "port",
+            "socks-port",
+            "redir-port",
+            "tproxy-port",
+            "listeners",
+            "tunnels",
+            "external-ui",
+            "external-controller-tls",
+            "external-controller-cors",
+            "tun",
+            "iptables",
+            "ebpf",
+            "auto-redir",
+            "auto-route",
+            "routing-mark",
+        ] {
+            assert!(preview.get(key).is_none(), "unsafe field {key}");
+        }
+    }
+
+    #[test]
+    fn preview_rejects_transparent_routing_and_full_profile_takeover() {
+        let mut state = State::default();
+        state.settings.tun = true;
+        assert!(render_isolated_preview(&state).unwrap_err().contains("TUN"));
+        state.settings.tun = false;
+        state.settings.profile = Some("0123abcd".into());
+        assert!(render_isolated_preview(&state)
+            .unwrap_err()
+            .contains("profile"));
+    }
+
+    #[test]
+    fn preview_rejects_malformed_and_duplicate_subscriptions() {
+        for id in [
+            "../root",
+            "../../etc/passwd",
+            "",
+            "0000000",
+            "000000000",
+            "001122xz",
+            "zzzzzzzz",
+        ] {
+            let state = State {
+                subscriptions: vec![subscription(id, true)],
+                ..Default::default()
+            };
+            assert!(
+                render_isolated_preview(&state).is_err(),
+                "accepted invalid id {id:?}"
+            );
+        }
+        let state = State {
+            subscriptions: vec![
+                subscription("AABB1122", true),
+                subscription("aabb1122", true),
+            ],
+            ..Default::default()
+        };
+        assert!(render_isolated_preview(&state)
+            .unwrap_err()
+            .contains("duplicate"));
+
+        let mut invalid_url = subscription("0123abcd", true);
+        invalid_url.url = "file:///etc/passwd".into();
+        assert!(render_isolated_preview(&State {
+            subscriptions: vec![invalid_url],
+            ..Default::default()
+        })
+        .is_err());
+        let mut invalid_interval = subscription("0123abcd", true);
+        invalid_interval.interval_hours = 721;
+        assert!(render_isolated_preview(&State {
+            subscriptions: vec![invalid_interval],
+            ..Default::default()
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn preview_accepts_sixteen_existing_subscriptions_but_not_seventeen() {
+        let mut state = State::default();
+        state.subscriptions = (0..16)
+            .map(|n| subscription(&format!("{n:08x}"), true))
+            .collect();
+        assert!(render_isolated_preview(&state).is_ok());
+        state.subscriptions.push(subscription("ffffffff", true));
+        assert!(render_isolated_preview(&state).is_err());
+    }
+
+    #[test]
+    fn preview_does_not_change_the_legacy_renderer() {
+        let state = State {
+            settings: Settings {
+                tun: true,
+                mixed_port: 7890,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let legacy = render(&state, "192.168.0.1", None, false).unwrap();
+        assert_eq!(legacy["mixed-port"], 7890);
+        assert_eq!(legacy["allow-lan"], true);
+        assert_eq!(legacy["external-controller"], "192.168.0.1:9097");
+        assert_eq!(legacy["external-controller-unix"], CONTROLLER_SOCKET);
+        assert_eq!(legacy["ntp"]["enable"], true);
+        assert_eq!(legacy["dns"]["enable"], true);
+        assert_eq!(legacy["tun"]["enable"], true);
     }
 }
 
