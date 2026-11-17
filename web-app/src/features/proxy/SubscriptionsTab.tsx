@@ -7,7 +7,17 @@ import type { ProxySubscription, ProxySubscriptions } from '../../types'
 import { Button, Field, Input, Select, Toggle } from '../../ui/controls'
 import { confirm, toast, toastError } from '../../ui/feedback'
 import { Card, Chip, Empty, InlineStatus, Meter, Skeleton } from '../../ui/primitives'
-import { ago, expiry, INTERVAL_OPTIONS, intervalLabel, usagePct, usageTone, usedBytes, validateSubscription } from './proxyView'
+import {
+  ago,
+  DEFAULT_SUBSCRIPTION_INTERVAL_HOURS,
+  expiry,
+  INTERVAL_OPTIONS,
+  intervalLabel,
+  usagePct,
+  usageTone,
+  usedBytes,
+  validateSubscription,
+} from './proxyView'
 import { t } from '../../i18n'
 
 export default function SubscriptionsTab() {
@@ -321,7 +331,7 @@ function AddSubscription({ onAdded }: { onAdded: () => void }) {
   const [useConfig, setUseConfig] = useState(true)
   const [name, setName] = useState('')
   const [url, setUrl] = useState('')
-  const [intervalHours, setIntervalHours] = useState(24)
+  const [intervalHours, setIntervalHours] = useState(DEFAULT_SUBSCRIPTION_INTERVAL_HOURS)
   const [errors, setErrors] = useState<{ name?: string; url?: string }>({})
   const [busy, setBusy] = useState(false)
 

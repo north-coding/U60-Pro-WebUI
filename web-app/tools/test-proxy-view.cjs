@@ -58,6 +58,11 @@ test('service state distinguishes missing core, failing and stopped', () => {
   assert.equal(view.serviceState(base).label, 'Stopped')
 })
 
+test('new subscriptions default to manual-only updates', () => {
+  assert.equal(view.DEFAULT_SUBSCRIPTION_INTERVAL_HOURS, 0)
+  assert.equal(view.intervalLabel(view.DEFAULT_SUBSCRIPTION_INTERVAL_HOURS), 'Manual only')
+})
+
 test('subscriptions mapper drops malformed rows and empty usage', () => {
   const d = map.mapProxySubscriptions({
     running: true,

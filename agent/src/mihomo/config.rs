@@ -26,6 +26,7 @@ const MAX_SUBSCRIPTIONS: usize = 16;
 const MAX_NAME_CHARS: usize = 32;
 const MAX_URL_LEN: usize = 2048;
 const MAX_INTERVAL_HOURS: u32 = 720;
+pub const DEFAULT_SUBSCRIPTION_INTERVAL_HOURS: u32 = 0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -191,6 +192,10 @@ pub fn validate_interval(hours: u64) -> Result<u32, String> {
         return Err(format!("interval must be 0-{MAX_INTERVAL_HOURS} hours"));
     }
     Ok(hours as u32)
+}
+
+pub fn subscription_interval(hours: Option<u64>) -> Result<u32, String> {
+    validate_interval(hours.unwrap_or(u64::from(DEFAULT_SUBSCRIPTION_INTERVAL_HOURS)))
 }
 
 pub fn validate_port(port: u64) -> Result<u16, String> {
@@ -519,6 +524,25 @@ mod tests {
         assert_eq!(p["interval"], 24 * 3600);
         assert_eq!(c["proxy-groups"][0]["use"], json!(["sub-aaaa0001"]));
         assert_eq!(c["proxy-groups"][1]["name"], "AUTO");
+    }
+
+    #[test]
+    fn omitted_subscription_interval_defaults_to_manual_only() {
+        assert_eq!(subscription_interval(None).unwrap(), 0);
+        assert_eq!(subscription_interval(Some(24)).unwrap(), 24);
+        assert!(subscription_interval(Some(721)).is_err());
+    }
+
+    #[test]
+    fn manual_only_subscription_provider_has_no_periodic_refresh() {
+        let mut subscription = sub("aaaa0001", true);
+        subscription.interval_hours = DEFAULT_SUBSCRIPTION_INTERVAL_HOURS;
+        let state = State {
+            subscriptions: vec![subscription],
+            ..Default::default()
+        };
+        let c = render(&state, "192.168.0.1", None, false).unwrap();
+        assert_eq!(c["proxy-providers"]["sub-aaaa0001"]["interval"], 0);
     }
 
     #[test]

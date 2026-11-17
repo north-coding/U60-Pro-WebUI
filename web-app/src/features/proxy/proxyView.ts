@@ -43,6 +43,8 @@ export const INTERVAL_OPTIONS: { value: number; label: string }[] = [
   { value: 168, label: t('Weekly') },
 ]
 
+export const DEFAULT_SUBSCRIPTION_INTERVAL_HOURS = 0
+
 export function intervalLabel(hours: number): string {
   return INTERVAL_OPTIONS.find((o) => o.value === hours)?.label ?? t('Every {n} h', { n: hours })
 }

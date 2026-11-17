@@ -1190,7 +1190,7 @@ impl Manager {
             Ok(u) => u,
             Err(e) => return bad(e),
         };
-        let interval = match config::validate_interval(v["interval_hours"].as_u64().unwrap_or(24)) {
+        let interval = match config::subscription_interval(v["interval_hours"].as_u64()) {
             Ok(i) => i,
             Err(e) => return bad(e),
         };
