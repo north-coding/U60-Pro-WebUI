@@ -31,6 +31,12 @@ Owner: north-coding. Development host: Mac Dev only. This ledger tracks **tempor
 | `/tmp/u60-g1b-offline-codex-20261117.log` | G1-B | Partial agent execution evidence; session terminated after prolonged inactivity; resulting files separately verified | PENDING_CLEANUP | After G1-B PR lifecycle decision |
 | `/tmp/u60-g1b-local-tests-20261117.log` | G1-B | Local offline and regression test evidence (when generated) | PENDING_CLEANUP | After G1-B PR lifecycle decision |
 
+| `/tmp/u60-g1b-focused-review-20261117.md` | G1-B | Focused ChatGPT exact-diff/surrounding-source review; startup side-effect finding and disposition | PENDING_CLEANUP | After Draft PR #3 final review |
+| `/tmp/u60-g1b-review-remediate-task-20261117.md` | G1-B | Scoped Codex follow-up contract for review finding | PENDING_CLEANUP | After PR #3 lifecycle decision |
+| `/tmp/u60-g1b-review-remediate-codex-20261117.log` | G1-B | Interrupted overbroad source scan; no edits; preserved for cost/traceability | PENDING_CLEANUP | After PR #3 lifecycle decision |
+| `/tmp/u60-g1b-reviewed-local-tests-20261117.log` | G1-B | Post-remediation local test and safety check record | PENDING_CLEANUP | After PR #3 lifecycle decision |
+| `/tmp/u60-g1b-draft-pr-body-20261117.md` | G1-B | Draft PR #3 description and review disposition | PENDING_CLEANUP | After PR #3 lifecycle decision |
+
 Next review: after G1-B offline focused audit; before any G1-B device-facing SSH installer work. Only the Owner-approved lifecycle may authorize deleting authoritative evidence or worktrees with unresolved recovery value. **No cleanup performed in G0/G1-A.**
 
 No GitHub Actions/CI is authorized; local tests and proportionate independent review are the evidence source.

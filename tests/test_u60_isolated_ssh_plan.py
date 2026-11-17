@@ -214,6 +214,9 @@ class IsolatedSshPlanTests(unittest.TestCase):
         self.assertIn("Preserve the recorded rc.local SHA-256", output.getvalue())
         self.assertIn("Preserve recorded /data/mihomo state (not present)", output.getvalue())
         self.assertNotIn("ready for deployment", output.getvalue().lower())
+        self.assertIn("Rust Agent startup can modify USB, TTL, DNS, Mihomo, LAN", output.getvalue())
+        self.assertIn("do not launch it", output.getvalue())
+        self.assertIn("unpinned accept-new host keys", output.getvalue())
 
         output = io.StringIO()
         with contextlib.redirect_stdout(output):

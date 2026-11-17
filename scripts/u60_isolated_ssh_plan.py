@@ -122,6 +122,8 @@ def main(argv: list[str] | None = None) -> int:
         f"- Preserve recorded /data/mihomo state "
         f"({'present' if plan['mihomo_data_present'] else 'not present'}); do not require it to be empty."
     )
+    print("- STOP: The unmodified Rust Agent startup can modify USB, TTL, DNS, Mihomo, LAN, and device state; do not launch it.")
+    print("- STOP: Runtime paths/ports are not isolated, and existing SSH deployment uses unpinned accept-new host keys.")
     print("- No files are transferred, no shell or change instructions are generated, and no device is contacted.")
     print("- This local result is not device-readiness evidence; later on-device revalidation is required.")
     return 0
