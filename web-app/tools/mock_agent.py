@@ -1986,7 +1986,7 @@ def post_proxy_subscription_add(body):
     masked = _check_url(obj.get("url"))
     sub_id = "%08x" % (len(_proxy()["subs"]) * 7919 + 0x10000000)
     _proxy()["subs"].append({"id": sub_id, "name": name.strip(), "url_masked": masked, "enabled": True,
-                             "interval_hours": obj.get("interval_hours", 24), "updated": None, "usage": None,
+                             "interval_hours": obj.get("interval_hours", 0), "updated": None, "usage": None,
                              "full": False if obj.get("use_config") else None,
                              "error": "Not fetched in demo mode"})
     warning = "the subscription has no groups or rules; it was added as a node source" if obj.get("use_config") else None

@@ -197,7 +197,6 @@ class WifiReadBack(MockCase):
         self.assertEqual(wifi['txpower_5g'], '80')
         self.assertEqual((wifi['htmode_5g'], wifi['actual_bw_5g']), ('EHT160', '160 MHz'))
         self.assertEqual(self.data('PUT', '/api/wifi/settings', {'txpower_2g': '40'})['changed'], False)
-
     def test_invalid_values_are_rejected_and_change_nothing(self):
         before = self.data('GET', '/api/wifi/status')
         for bad in (0, 101, 'abc', -1, 3.5, None):
@@ -224,6 +223,17 @@ class WifiReadBack(MockCase):
         status, _, raw = self.raw('PUT', '/api/wifi/settings')
         self.assertEqual(status, 400)
         self.assertFalse(json.loads(raw)['ok'])
+
+
+class ProxySubscriptionFlow(MockCase):
+    def test_add_defaults_to_manual_only_and_masks_the_link(self):
+        self.data('POST', '/api/proxy/subscriptions', {
+            'name': 'Airport', 'url': 'https://sub.example/secret-token'})
+        subscriptions = self.data('GET', '/api/proxy/subscriptions')['subscriptions']
+        airport = next(sub for sub in subscriptions if sub['name'] == 'Airport')
+        self.assertEqual(airport['interval_hours'], 0)
+        self.assertFalse(airport['use_config'])
+        self.assertNotIn('secret-token', json.dumps(subscriptions))
 
 
 class RadioReadBack(MockCase):
