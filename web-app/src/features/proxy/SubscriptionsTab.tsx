@@ -10,6 +10,7 @@ import { Card, Chip, Empty, InlineStatus, Meter, Skeleton } from '../../ui/primi
 import {
   ago,
   DEFAULT_SUBSCRIPTION_INTERVAL_HOURS,
+  DEFAULT_SUBSCRIPTION_USE_CONFIG,
   expiry,
   INTERVAL_OPTIONS,
   intervalLabel,
@@ -18,22 +19,87 @@ import {
   usedBytes,
   validateSubscription,
 } from './proxyView'
+import { runSubscriptionUpdateFlow, waitForProxyReady, type SubscriptionFlowOutcome } from './subscriptionFlow'
 import { t } from '../../i18n'
+
+type UpdateTarget = { id: string; name: string }
+
+function confirmProxyStartAndUpdate(targets: UpdateTarget[]) {
+  const targetLabel = targets.length === 1
+    ? targets[0].name
+    : t('{n} enabled subscriptions', { n: targets.length })
+  return confirm({
+    title: t('Start Mihomo and update?'),
+    body: t('This starts Mihomo now and leaves it running after the update. It also enables Mihomo to start with the router.'),
+    kind: 'connection',
+    details: [{ label: t('Subscriptions'), value: targetLabel }],
+    consequence: t('If transparent proxy is enabled, LAN traffic may route through Mihomo.'),
+    recovery: t('Stop Mihomo in Overview or turn off transparent proxy in Settings.'),
+    confirmLabel: targets.length === 1 ? t('Start & update') : t('Start & update all'),
+  })
+}
+
+async function refreshSubscriptions(running: boolean, targets: UpdateTarget[], id?: string) {
+  return runSubscriptionUpdateFlow({
+    running,
+    expectedIds: targets.map((target) => target.id),
+    confirmStart: () => confirmProxyStartAndUpdate(targets),
+    start: async () => {
+      await api.proxyService('start')
+    },
+    waitUntilReady: () => waitForProxyReady(({ signal, timeoutMs }) => api.proxyGroups(timeoutMs, signal)),
+    refresh: () => api.proxySubscriptionUpdate(id),
+  })
+}
+
+function reportSubscriptionRefresh(outcome: SubscriptionFlowOutcome, targets: UpdateTarget[], all: boolean) {
+  switch (outcome.status) {
+    case 'cancelled':
+      return
+    case 'start-failed':
+      toastError(outcome.error, t('Failed to start the proxy'))
+      return
+    case 'not-ready':
+      toast(t('Mihomo did not become ready. Subscriptions were not updated.'), 'err')
+      return
+    case 'readiness-failed':
+      toastError(outcome.error, t('Could not confirm Mihomo readiness. Subscriptions were not updated.'))
+      return
+    case 'update-failed':
+      toastError(outcome.error, all ? t('Failed to update subscriptions') : t('Failed to update the subscription'))
+      return
+    case 'updated': {
+      const { summary } = outcome
+      if (summary.failureCount === 0 && summary.successCount === targets.length && !summary.malformed) {
+        toast(all ? t('Subscriptions updated') : t('{name} updated', { name: targets[0].name }))
+        return
+      }
+      if (!all) {
+        const result = summary.results[targets[0].id]
+        toast(t('{name}: {error}', { name: targets[0].name, error: result?.error || t('update failed') }), 'err')
+        return
+      }
+      toast(t('{updated} of {total} subscriptions updated; {failed} failed', {
+        updated: summary.successCount,
+        total: targets.length,
+        failed: summary.failureCount,
+      }), 'err')
+    }
+  }
+}
 
 export default function SubscriptionsTab() {
   const subs = usePoll<ProxySubscriptions>('proxy-subscriptions', api.proxySubscriptions, 15_000)
   const [updatingAll, setUpdatingAll] = useState(false)
+  const [updatingSubscriptionId, setUpdatingSubscriptionId] = useState<string | null>(null)
 
   async function updateAll() {
+    const targets = (subs.data?.subscriptions ?? []).filter((sub) => sub.enabled).map(({ id, name }) => ({ id, name }))
+    if (!targets.length) return
     setUpdatingAll(true)
     try {
-      const r = await api.proxySubscriptionUpdate()
-      const results = (r.results ?? {}) as Record<string, { ok?: boolean }>
-      const failed = Object.values(results).filter((x) => !x.ok).length
-      if (failed) toast(t('{n} subscription(s) failed to update', { n: failed }), 'err')
-      else toast(t('Subscriptions updated'))
-    } catch (e) {
-      toastError(e, t('Failed to update subscriptions'))
+      const outcome = await refreshSubscriptions(!!subs.data?.running, targets)
+      reportSubscriptionRefresh(outcome, targets, true)
     } finally {
       setUpdatingAll(false)
       subs.refresh()
@@ -56,7 +122,7 @@ export default function SubscriptionsTab() {
       <div className="space-y-3">
         {!subs.data.running && (
           <InlineStatus kind="info" live={false}>
-            {t('The proxy is stopped. Node counts, usage and updates appear once it runs.')}
+            {t('The proxy is stopped. Start Mihomo with an explicit update action to fetch enabled subscriptions.')}
           </InlineStatus>
         )}
         <ul className="divide-y divide-line/6">
@@ -66,6 +132,8 @@ export default function SubscriptionsTab() {
               sub={s}
               running={subs.data!.running}
               profileActive={subs.data!.subscriptions.some((x) => x.use_config)}
+              updatesLocked={updatingAll || updatingSubscriptionId !== null}
+              onUpdateBusyChange={(busy) => setUpdatingSubscriptionId(busy ? s.id : null)}
               onChanged={subs.refresh}
             />
           ))}
@@ -74,15 +142,15 @@ export default function SubscriptionsTab() {
     )
   }
 
-  const canUpdateAll = !!subs.data?.running && subs.data.subscriptions.some((s) => s.enabled)
+  const canUpdateAll = subs.data?.subscriptions.some((s) => s.enabled) ?? false
 
   return (
     <>
       <Card
         title={t('Subscriptions')}
         action={
-          <Button size="sm" variant="outline" onClick={() => void updateAll()} loading={updatingAll} disabled={!canUpdateAll}>
-            {t('Update all')}
+          <Button size="sm" variant="outline" onClick={() => void updateAll()} loading={updatingAll} disabled={!canUpdateAll || updatingAll || updatingSubscriptionId !== null}>
+            {subs.data && !subs.data.running ? t('Start & update all') : t('Update all')}
           </Button>
         }
       >
@@ -97,11 +165,15 @@ function SubscriptionRow({
   sub,
   running,
   profileActive,
+  updatesLocked,
+  onUpdateBusyChange,
   onChanged,
 }: {
   sub: ProxySubscription
   running: boolean
   profileActive: boolean
+  updatesLocked: boolean
+  onUpdateBusyChange: (busy: boolean) => void
   onChanged: () => void
 }) {
   const [busy, setBusy] = useState<'update' | 'toggle' | 'delete' | 'config' | null>(null)
@@ -113,15 +185,14 @@ function SubscriptionRow({
 
   async function update() {
     setBusy('update')
+    onUpdateBusyChange(true)
     try {
-      const r = await api.proxySubscriptionUpdate(sub.id)
-      const result = ((r.results ?? {}) as Record<string, { ok?: boolean; error?: string }>)[sub.id]
-      if (result && !result.ok) toast(`${sub.name}: ${result.error ?? t('update failed')}`, 'err')
-      else toast(t('{name} updated', { name: sub.name }))
-    } catch (e) {
-      toastError(e, t('Failed to update the subscription'))
+      const targets = [{ id: sub.id, name: sub.name }]
+      const outcome = await refreshSubscriptions(running, targets, sub.id)
+      reportSubscriptionRefresh(outcome, targets, false)
     } finally {
       setBusy(null)
+      onUpdateBusyChange(false)
       onChanged()
     }
   }
@@ -189,12 +260,12 @@ function SubscriptionRow({
         </div>
         <div className="flex flex-wrap items-center justify-end gap-1">
           {sub.use_config ? (
-            <Button size="sm" variant="ghost" onClick={() => void setUseConfig(false)} loading={busy === 'config'} disabled={!!busy}>
+              <Button size="sm" variant="ghost" onClick={() => void setUseConfig(false)} loading={busy === 'config'} disabled={!!busy || updatesLocked}>
               {t('Use managed rules')}
             </Button>
           ) : (
             sub.enabled && (
-              <Button size="sm" variant="ghost" onClick={() => void setUseConfig(true)} loading={busy === 'config'} disabled={!!busy}>
+              <Button size="sm" variant="ghost" onClick={() => void setUseConfig(true)} loading={busy === 'config'} disabled={!!busy || updatesLocked}>
                 {t('Use its rules')}
               </Button>
             )
@@ -202,10 +273,10 @@ function SubscriptionRow({
           <Toggle
             checked={sub.enabled}
             onChange={(v) => void toggle(v)}
-            disabled={!!busy}
+            disabled={!!busy || updatesLocked}
             label={t('Use {name}', { name: sub.name })}
           />
-          <Button size="sm" variant="ghost" onClick={() => setEditing((v) => !v)} disabled={!!busy}>
+          <Button size="sm" variant="ghost" onClick={() => setEditing((v) => !v)} disabled={!!busy || updatesLocked}>
             {editing ? t('Close') : t('Edit')}
           </Button>
           <Button
@@ -213,11 +284,11 @@ function SubscriptionRow({
             variant="outline"
             onClick={() => void update()}
             loading={busy === 'update'}
-            disabled={!!busy || !sub.enabled || (!sub.use_config && (!running || profileActive))}
+            disabled={!!busy || updatesLocked || !sub.enabled || (!sub.use_config && profileActive)}
           >
-            {t('Update')}
+            {!running ? t('Start & update') : t('Update')}
           </Button>
-          <Button size="sm" variant="ghost" onClick={() => void remove()} loading={busy === 'delete'} disabled={!!busy} aria-label={t('Delete {name}', { name: sub.name })}>
+          <Button size="sm" variant="ghost" onClick={() => void remove()} loading={busy === 'delete'} disabled={!!busy || updatesLocked} aria-label={t('Delete {name}', { name: sub.name })}>
             <ITrash size={15} />
           </Button>
         </div>
@@ -328,7 +399,7 @@ function EditSubscription({ sub, onDone }: { sub: ProxySubscription; onDone: () 
 }
 
 function AddSubscription({ onAdded }: { onAdded: () => void }) {
-  const [useConfig, setUseConfig] = useState(true)
+  const [useConfig, setUseConfig] = useState(DEFAULT_SUBSCRIPTION_USE_CONFIG)
   const [name, setName] = useState('')
   const [url, setUrl] = useState('')
   const [intervalHours, setIntervalHours] = useState(DEFAULT_SUBSCRIPTION_INTERVAL_HOURS)
@@ -398,12 +469,12 @@ function AddSubscription({ onAdded }: { onAdded: () => void }) {
         </div>
         <div className="flex items-start justify-between gap-4 sm:col-span-2">
           <div>
-            <p className="text-body font-medium text-ink">{t('Use the subscription’s own rules and groups')}</p>
+            <p className="text-body font-medium text-ink">{t('Advanced: use the provider’s complete configuration')}</p>
             <p className="mt-0.5 text-meta text-ink2">
-              {t('Recommended for providers that serve a complete Clash/mihomo config. Turn off to use only its nodes with the managed rules.')}
+              {t('Recommended: import only the provider’s nodes. Managed Rule mode uses the bypass_cn preset: mainland China traffic is DIRECT, foreign traffic is PROXY.')}
             </p>
           </div>
-          <Toggle checked={useConfig} onChange={setUseConfig} label={t('Use the subscription’s own rules and groups')} />
+          <Toggle checked={useConfig} onChange={setUseConfig} label={t('Import the complete provider configuration')} />
         </div>
         <div className="sm:col-span-2">
           <Button type="submit" variant="primary" loading={busy}>

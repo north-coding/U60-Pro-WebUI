@@ -306,3 +306,17 @@ test('home maps usage with null counters and unknown reset configuration', async
   assert.equal(home.usage.reset_enabled, null)
   assert.equal(home.usage.reset_day, null)
 })
+
+test('proxy groups forwards a bounded request timeout and cancellation signal', async () => {
+  const calls = []
+  const client = {
+    get: async (...args) => { calls.push(args); return { running: true, groups: [], nodes: [] } },
+  }
+  const api = loadTs('data/api.ts', { stubs: { client } }).api
+  const signal = new AbortController().signal
+  const groups = await api.proxyGroups(750, signal)
+  assert.equal(calls[0][0], '/api/proxy/groups')
+  assert.equal(calls[0][1], 750)
+  assert.equal(calls[0][2], signal)
+  assert.equal(groups.running, true)
+})
