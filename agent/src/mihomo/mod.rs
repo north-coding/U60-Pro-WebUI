@@ -72,6 +72,10 @@ struct Inner {
     health: Health,
     /// The mainland bypass rules were in place at the last check.
     bypass_active: bool,
+    /// Exact runtime resources inserted by this manager instance. Adopted or
+    /// pre-existing resources are deliberately not claimed for cleanup.
+    firewall_lease: service::FirewallLease,
+    bypass_lease: service::BypassLease,
     /// The live config's controller secret, cached by file modification time.
     panel_secret: Option<(std::time::SystemTime, String)>,
 }
@@ -222,6 +226,8 @@ impl Manager {
                 traffic: None,
                 firewall_checked: None,
                 bypass_active: false,
+                firewall_lease: service::FirewallLease::default(),
+                bypass_lease: service::BypassLease::default(),
                 panel_secret: None,
                 profile_attempt: None,
                 health: Health::default(),
@@ -528,8 +534,8 @@ impl Inner {
                 "[mihomo] exited unexpectedly: {}",
                 self.last_error.as_deref().unwrap_or("")
             );
-            service::firewall_remove();
-            service::cleanup_routing();
+            self.remove_owned_firewall();
+            self.sync_bypass();
         }
         while self
             .crashes
@@ -579,8 +585,9 @@ impl Inner {
             self.firewall_checked = Some(Instant::now());
             if !service::firewall_present() {
                 eprintln!("[mihomo] TUN firewall accepts were missing (fw3 reload?) — restoring");
-                if let Err(e) = service::firewall_add() {
-                    self.last_error = Some(e);
+                match service::firewall_add() {
+                    Ok(lease) => self.firewall_lease.extend(lease),
+                    Err(e) => self.last_error = Some(e),
                 }
             }
             self.sync_bypass();
@@ -598,22 +605,37 @@ impl Inner {
         if want {
             if !service::bypass_present() {
                 match service::bypass_add() {
-                    Ok(0) => eprintln!("[mihomo] mainland bypass rules restored"),
-                    Ok(n) => eprintln!("[mihomo] mainland bypass on ({n} prefixes)"),
+                    Ok((0, lease)) => {
+                        self.bypass_lease.extend(lease);
+                        eprintln!("[mihomo] mainland bypass rules restored");
+                    }
+                    Ok((n, lease)) => {
+                        self.bypass_lease.extend(lease);
+                        eprintln!("[mihomo] mainland bypass on ({n} prefixes)");
+                    }
                     Err(e) => {
                         eprintln!("[mihomo] mainland bypass failed: {e}");
                         self.last_error = Some(format!("mainland bypass: {e}"));
-                        service::bypass_remove();
                     }
                 }
             }
             self.bypass_active = service::bypass_present();
         } else {
-            if self.bypass_active || service::bypass_present() {
-                service::bypass_remove();
+            if !self.bypass_lease.is_empty() {
+                let lease = std::mem::take(&mut self.bypass_lease);
+                service::bypass_remove(lease);
                 eprintln!("[mihomo] mainland bypass off");
             }
-            self.bypass_active = false;
+            // Existing resources without a lease are intentionally retained;
+            // their owner cannot be proven by a priority or set name alone.
+            self.bypass_active = service::bypass_present();
+        }
+    }
+
+    fn remove_owned_firewall(&mut self) {
+        let lease = std::mem::take(&mut self.firewall_lease);
+        if !lease.is_empty() {
+            service::firewall_remove(lease);
         }
     }
 
@@ -653,17 +675,23 @@ impl Inner {
         // The LAN address may have changed since the file was written.
         let state = self.state.clone();
         self.write_config(&state)?;
-        service::cleanup_routing();
+        service::preflight_routing(self.state.settings.tun)?;
         if self.state.settings.tun {
-            service::firewall_add()?;
+            let lease = service::firewall_add()?;
+            self.firewall_lease.extend(lease);
         }
-        let mut process = service::spawn()?;
+        let mut process = match service::spawn() {
+            Ok(process) => process,
+            Err(error) => {
+                self.remove_owned_firewall();
+                return Err(error);
+            }
+        };
         // Catch an immediate failure (bad port, TUN error) while the user waits.
         for _ in 0..15 {
             std::thread::sleep(Duration::from_millis(200));
             if !process.alive() {
-                service::firewall_remove();
-                service::cleanup_routing();
+                self.remove_owned_firewall();
                 return Err(service::log_tail_error()
                     .unwrap_or_else(|| "mihomo exited during start".into()));
             }
@@ -687,10 +715,9 @@ impl Inner {
             let forced = process.terminate();
             eprintln!("[mihomo] stopped{}", if forced { " (killed)" } else { "" });
         }
-        service::firewall_remove();
-        service::cleanup_routing();
+        self.remove_owned_firewall();
         self.traffic = None;
-        self.bypass_active = false;
+        self.sync_bypass();
     }
 
     fn restart(&mut self) -> Result<(), String> {
@@ -1641,6 +1668,8 @@ mod tests {
                     traffic: None,
                     firewall_checked: None,
                     bypass_active: false,
+                    firewall_lease: service::FirewallLease::default(),
+                    bypass_lease: service::BypassLease::default(),
                     panel_secret: None,
                     profile_attempt: None,
                     health: Health::default(),
@@ -1936,7 +1965,8 @@ mod device_tests {
         assert!(service::firewall_present());
 
         // Watchdog: accepts flushed by a firewall reload are restored.
-        service::firewall_remove();
+        let stale = std::mem::take(&mut m.lock().firewall_lease);
+        service::firewall_remove(stale);
         m.lock().firewall_checked = None;
         m.lock().tick();
         assert!(service::firewall_present());

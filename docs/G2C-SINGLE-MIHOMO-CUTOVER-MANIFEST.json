@@ -1,0 +1,261 @@
+{
+  "schema_version": 1,
+  "plan_id": "u60-single-mihomo-cutover-v1",
+  "execution_mode": "dry-run-only",
+  "device_mutations_supported": false,
+  "ownership_classes": [
+    "stock_zte_protected",
+    "project_owned",
+    "mihomo_owned",
+    "unknown"
+  ],
+  "protected_components": [
+    {
+      "id": "stock-cellular-and-apn",
+      "classification": "stock_zte_protected",
+      "description": "Cellular service, SIM/eSIM state, APN profiles, and WAN interfaces.",
+      "paths": ["/etc/config/network"]
+    },
+    {
+      "id": "stock-wifi-and-router-management",
+      "classification": "stock_zte_protected",
+      "description": "Stock Wi-Fi, LAN/DHCP, firewall, router UI, and ZTE system services.",
+      "paths": ["/etc/config/wireless", "/etc/config/firewall", "/etc/config/zte_topsw_daemon.conf"]
+    },
+    {
+      "id": "root-ssh-and-keys",
+      "classification": "stock_zte_protected",
+      "description": "Root Dropbear service, host/client keys, and installed project-owned SSH launcher.",
+      "paths": ["/etc/dropbear", "/data/bin/dropbear", "/data/local/tmp/start_dropbear.sh"]
+    },
+    {
+      "id": "usb-ecm-and-configfs",
+      "classification": "stock_zte_protected",
+      "description": "USB ECM composition, ConfigFS state, saved USB mode, and the live usb_op node.",
+      "paths": ["/data/local/tmp/usb_config.json", "/sys/devices/virtual/android_usb/android0/usb_op"]
+    },
+    {
+      "id": "stock-dashboard-and-rc-local-body",
+      "classification": "stock_zte_protected",
+      "description": "Stock WebUI and full rc.local body; only the exact project-owned Agent startup entry may be changed after checks.",
+      "paths": ["/data/www", "/data/www.current", "/etc/rc.local"]
+    }
+  ],
+  "protected_paths": [
+    "/etc/config/zte_topsw_daemon.conf",
+    "/etc/config/wireless",
+    "/etc/config/network",
+    "/etc/config/firewall",
+    "/etc/dropbear",
+    "/data/bin/dropbear",
+    "/data/local/tmp/start_dropbear.sh",
+    "/data/local/tmp/start_dashboard.sh",
+    "/data/local/tmp/usb_config.json",
+    "/data/www",
+    "/data/www.current",
+    "/sys/devices/virtual/android_usb/android0/usb_op"
+  ],
+  "protected_path_prefixes": [
+    "/etc/init.d",
+    "/etc/rc.d",
+    "/zteoverlay",
+    "/sys/class/net"
+  ],
+  "candidate_cleanup_targets": [
+    {
+      "id": "legacy-agent-binary",
+      "path": "/data/zte-agent",
+      "kind": "file",
+      "classification": "project_owned",
+      "owner_id": "u60-project-agent",
+      "action": "replace_after_verified_staging"
+    },
+    {
+      "id": "legacy-agent-startup",
+      "path": "/data/local/tmp/start_zte_agent.sh",
+      "kind": "file",
+      "classification": "project_owned",
+      "owner_id": "u60-project-agent",
+      "action": "replace_after_verified_staging"
+    },
+    {
+      "id": "legacy-mihomo-binary",
+      "path": "/data/mihomo/mihomo",
+      "kind": "file",
+      "classification": "mihomo_owned",
+      "owner_id": "legacy-mihomo",
+      "action": "remove_exact_file_after_cutover"
+    },
+    {
+      "id": "legacy-mihomo-config",
+      "path": "/data/mihomo/config.yaml",
+      "kind": "file",
+      "classification": "mihomo_owned",
+      "owner_id": "legacy-mihomo",
+      "action": "remove_exact_file_after_cutover"
+    },
+    {
+      "id": "legacy-mihomo-manager-state",
+      "path": "/data/mihomo/manager.json",
+      "kind": "file",
+      "classification": "mihomo_owned",
+      "owner_id": "legacy-mihomo",
+      "action": "remove_exact_file_after_cutover"
+    },
+    {
+      "id": "legacy-mihomo-cn-list",
+      "path": "/data/mihomo/cn.list",
+      "kind": "file",
+      "classification": "mihomo_owned",
+      "owner_id": "legacy-mihomo",
+      "action": "remove_exact_file_after_cutover"
+    },
+    {
+      "id": "legacy-mihomo-provider-cache",
+      "path": "/data/mihomo/providers",
+      "kind": "directory",
+      "classification": "mihomo_owned",
+      "owner_id": "legacy-mihomo",
+      "action": "remove_only_after_complete_child_inventory"
+    },
+    {
+      "id": "legacy-mihomo-profile-cache",
+      "path": "/data/mihomo/profiles",
+      "kind": "directory",
+      "classification": "mihomo_owned",
+      "owner_id": "legacy-mihomo",
+      "action": "remove_only_after_complete_child_inventory"
+    },
+    {
+      "id": "legacy-mihomo-panel",
+      "path": "/data/mihomo/ui",
+      "kind": "directory",
+      "classification": "mihomo_owned",
+      "owner_id": "legacy-mihomo",
+      "action": "remove_only_after_complete_child_inventory"
+    },
+    {
+      "id": "legacy-mihomo-pid",
+      "path": "/var/run/mihomo.pid",
+      "kind": "file",
+      "classification": "mihomo_owned",
+      "owner_id": "legacy-mihomo",
+      "action": "remove_exact_file_after_process_stop"
+    },
+    {
+      "id": "legacy-mihomo-log",
+      "path": "/tmp/mihomo.log",
+      "kind": "file",
+      "classification": "mihomo_owned",
+      "owner_id": "legacy-mihomo",
+      "action": "remove_exact_file_after_process_stop"
+    },
+    {
+      "id": "legacy-agent-rc-local-entry",
+      "path": "/etc/rc.local",
+      "kind": "startup_entry",
+      "classification": "project_owned",
+      "owner_id": "u60-project-agent",
+      "exact_entry": "sh /data/local/tmp/start_zte_agent.sh",
+      "action": "replace_exact_entry_only"
+    }
+  ],
+  "managed_services": [
+    {"name": "zte-agent", "owner_id": "u60-project-agent"},
+    {"name": "mihomo", "owner_id": "legacy-mihomo"}
+  ],
+  "required_artifacts": [
+    {"id": "new-agent", "arch": "aarch64", "purpose": "staged authenticated proxy-management Agent"},
+    {"id": "mihomo-binary", "arch": "aarch64", "purpose": "single new managed Mihomo binary"},
+    {"id": "fresh-mihomo-config", "arch": null, "purpose": "generated from new managed settings; no old config import"},
+    {"id": "new-startup-script", "arch": null, "purpose": "explicit proxy-management-only startup invocation"},
+    {"id": "rollback-snapshot", "arch": null, "purpose": "project Agent/startup and rc.local baseline only; excludes abandoned Mihomo configuration and provider data"}
+  ],
+  "rollback_scope": {
+    "preserve": ["the complete pre-change rc.local body", "exact project-owned startup line", "existing auth inputs without exposing them", "stock router services"],
+    "exclude": ["old Mihomo configuration", "old subscriptions and provider cache", "stock firmware, SSH keys, USB assets, and cellular/Wi-Fi configuration"],
+    "fallback": "stop only positively identified new project processes and return the router to stock forwarding; do not restart legacy Mihomo"
+  },
+  "offline_preparation_checks": [
+    "artifact_hashes_verified",
+    "fresh_config_validated",
+    "startup_script_syntax_validated",
+    "rollback_snapshot_complete",
+    "rc_local_snapshot_complete",
+    "rc_local_exact_entry_restore_ready",
+    "new_service_stop_recovery_checked",
+    "stock_paths_excluded_from_mutations"
+  ],
+  "failure_recovery_checks": [
+    "rc_local_exact_entry_restore_ready",
+    "new_service_stop_recovery_checked",
+    "stock_paths_excluded_from_mutations"
+  ],
+  "activation_checks": [
+    "authenticated_proxy_management_only_startup",
+    "proxy_api_authentication_verified",
+    "mihomo_controller_health_verified",
+    "manual_subscription_refresh_verified",
+    "rule_mode_cn_direct_foreign_proxy_verified",
+    "wifi_client_data_plane_verified",
+    "stock_cellular_wifi_usb_ssh_services_verified"
+  ],
+  "minimum_authenticated_management_startup_work": [
+    {
+      "id": "early-mode-dispatch",
+      "files": ["agent/src/main.rs"],
+      "requirement": "Parse an explicit proxy-management-only mode before migration or any legacy boot initialization; preserve zero-argument behavior only for the existing legacy path.",
+      "status": "not_implemented"
+    },
+    {
+      "id": "minimal-proxy-state",
+      "files": ["agent/src/handlers.rs", "agent/src/mihomo/mod.rs"],
+      "requirement": "Construct only password authentication and the Mihomo manager; do not initialize unrelated device managers or recovery journals.",
+      "status": "not_implemented"
+    },
+    {
+      "id": "proxy-route-allowlist",
+      "files": ["agent/src/server.rs"],
+      "requirement": "Allow login, exact proxy-management routes, and the explicitly reviewed PAC route; return 404 for every other API route while retaining bearer authentication and body limits.",
+      "status": "not_implemented"
+    },
+    {
+      "id": "skip-legacy-side-effects",
+      "files": ["agent/src/main.rs"],
+      "requirement": "Do not run migration cleanup, event bus, charge/SMS/client-traffic workers, persisted TTL script, USB enforcement, or LAN recovery in proxy-management-only mode.",
+      "status": "not_implemented"
+    },
+    {
+      "id": "credential-and-binding-gate",
+      "files": ["agent/src/main.rs", "agent/src/lan.rs", "agent/src/auth.rs"],
+      "requirement": "Require an explicitly configured password and a reviewed LAN bind before listening; keep existing password lockout and token checks; make no SSH credential changes.",
+      "status": "not_implemented"
+    },
+    {
+      "id": "startup-activation-contract",
+      "files": ["scripts/render-agent-startup.py", "scripts/device/update-rc-local.sh", "scripts/deploy-components.py"],
+      "requirement": "Stage the explicit mode in the project-owned startup script and replace only its exact rc.local line after syntax, snapshot, rollback, authenticated health, and single-process ownership checks.",
+      "status": "not_implemented"
+    },
+    {
+      "id": "offline-startup-tests",
+      "files": ["agent/src/main.rs", "agent/src/server.rs"],
+      "requirement": "Test that legacy initialization hooks do not run in this mode, non-proxy endpoints are denied, missing credentials fail closed, and proxy routes remain authenticated.",
+      "status": "not_implemented"
+    }
+  ],
+  "failure_recovery_conditions": [
+    "Keep the stock rc.local body and restore or remove only the exact project-owned startup line using the verified snapshot and sh -n.",
+    "If activation fails, stop only positively identified new project processes and return to stock forwarding; do not rely on or restart legacy Mihomo.",
+    "Leave Mihomo-owned resources untouched when process or path ownership is unknown.",
+    "Do not remove a live process, route, firewall rule, SSH component, USB asset, or stock service during recovery.",
+    "Require shell syntax validation and authenticated health checks before changing the exact startup entry."
+  ],
+  "routing_policy": {
+    "automatic_cleanup_targets": [],
+    "conflict_rule_priority_range": [9000, 9099],
+    "conflict_route_table": "2022",
+    "check_before_both_tun_and_non_tun_starts": true,
+    "on_conflict": "fail_closed_and_require_read_only_owner_review"
+  }
+}
