@@ -1,5 +1,5 @@
 //! Subscriptions used as the full config: download with the device's curl,
-//! keep the raw YAML in /data/mihomo/profiles (0700), parse it to JSON.
+//! keep the raw YAML in /data/u60-pro-managed/mihomo/profiles (0700), parse it to JSON.
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
@@ -10,7 +10,7 @@ use serde_json::Value;
 
 use super::config::{mask_url, Fetched, Subscription, Usage};
 
-const DIR: &str = "/data/mihomo/profiles";
+const DIR: &str = super::paths::MIHOMO_PROFILES;
 const MAX_BYTES: u64 = 8 * 1024 * 1024;
 /// Providers return a Clash/mihomo config only to a Clash-like client.
 const USER_AGENT: &str = "clash.meta/mihomo";

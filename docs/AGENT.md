@@ -97,11 +97,14 @@ is a route below — `scripts/check-api-contract.py` enforces both directions
 
 ## Proxy (mihomo)
 
-`agent/src/mihomo/` manages a [mihomo](https://github.com/MetaCubeX/mihomo)
-core installed in `/data/mihomo` by `scripts/deploy-mihomo.sh` (pinned
-release, GitHub SHA-256 verified on both ends).
+`agent/src/mihomo/` manages one [mihomo](https://github.com/MetaCubeX/mihomo)
+instance under `/data/u60-pro-managed/mihomo`. This managed tree is separate
+from the abandoned legacy `/data/mihomo` tree. `scripts/deploy-mihomo.sh` still
+writes only to the legacy tree and is not an installer for this managed runtime;
+the future cutover installer must stage the new artifacts under the manifest's
+owned paths.
 
-- **State**: `/data/mihomo/manager.json` (0600) holds settings and
+- **State**: `/data/u60-pro-managed/mihomo/manager.json` (0600) holds settings and
   subscriptions. The API returns subscription links masked
   (`https://host/…`); full links never leave the router.
 - **Config**: rendered as JSON from typed state (`config.rs`), validated with
@@ -122,7 +125,7 @@ release, GitHub SHA-256 verified on both ends).
   The controller's `secret` is the subscription config's own (profile mode),
   otherwise empty, i.e. **no password**: any LAN device can open the panel and
   control the proxy. The agent uses the controller's unix socket
-  `/data/mihomo/mihomo.sock` instead, where mihomo applies no secret, so the
+  `/data/u60-pro-managed/mihomo/mihomo.sock` instead, where mihomo applies no secret, so the
   agent works whatever secret the config sets. `GET /api/proxy/status` reports
   `panel {installed, url, secret}`. An agent upgrading from the loopback-only
   controller restarts mihomo once (the old process has no socket to reload
@@ -134,7 +137,9 @@ release, GitHub SHA-256 verified on both ends).
   and restarts it if not.
 - **Listener**: the mixed HTTP/SOCKS port binds the LAN address only.
 - **Process**: started in its own session so agent restarts do not stop it;
-  a new agent re-adopts it from `/var/run/mihomo.pid`. The watchdog (5 s tick)
+  the current manager version can re-adopt a process only from its managed
+  `/data/u60-pro-managed/mihomo/mihomo.pid` after verifying its executable path;
+  it never reads the old `/var/run/mihomo.pid`. The watchdog (5 s tick)
   restarts it with exponential backoff (max 5 min), and turns TUN off after 3
   crashes in 10 minutes.
 - **TUN** (`settings.tun`): device `mihomo`, `include-interface: br-lan` only,
@@ -142,15 +147,17 @@ release, GitHub SHA-256 verified on both ends).
   domains come from the TLS/HTTP/QUIC sniffer. ZTE's fw3 rejects LAN→tun
   forwarding and tun INPUT, so while TUN runs the agent inserts tagged
   (`mihomo-tun`) iptables/ip6tables accepts at the top of FORWARD and INPUT,
-  re-asserts them every 15 s (fw3/QCMAP reloads flush them), and removes them on
-  stop. A force-killed mihomo's ip rules (prefs 9000–9099, table 2022) are
-  cleaned up. Nothing is written to the firmware: with TUN enabled the agent
-  re-applies the rules at boot; turning TUN off restores the stock route.
+  re-asserts them every 15 s (fw3/QCMAP reloads flush them), and removes only
+  rules leased by this manager instance on stop. A force-killed Mihomo's IP
+  rules (prefs 9000–9099, table 2022) are never swept by priority; a read-only
+  preflight blocks subsequent starts until the leftover state is reviewed.
+  Nothing is written to the firmware.
 - **Mainland bypass** (`settings.cn_bypass`, default on): TUN costs about one
   A55 core per 100 Mbit/s (measured 2026-10-06: ~90 Mbit/s domestic at 80–90%
   of a core). With the bypass, LAN packets to mainland IPv4 ranges (ipset
-  `mihomo-cn`, loaded from `/data/mihomo/cn.list`, which `deploy-mihomo.sh`
-  installs from a pinned MetaCubeX commit) get mark `0x10000000` in mangle
+  `mihomo-cn`, loaded from `/data/u60-pro-managed/mihomo/cn.list`, which the
+  future managed-runtime installer must stage from a pinned MetaCubeX commit)
+  get mark `0x10000000` in mangle
   PREROUTING, and ip rule 8999 sends them through the main table ahead of
   sing-tun's rules, so they keep the stock path and IPA offload (measured
   138–195 Mbit/s at ~0% mihomo CPU). Runtime only, re-asserted with the

@@ -179,17 +179,26 @@ regained and this is deployed again.
 - `mihomo/` (proxy): while TUN is enabled and mihomo runs, inserts tagged
   (`mihomo-tun`) ACCEPT rules at the top of FORWARD/INPUT for `br-lan`↔`mihomo`
   and `-i mihomo`, and mihomo adds ip rules 9000–9099 / table 2022 limited to
-  `iif br-lan`. All runtime only and removed on stop; when TUN is enabled the
-  agent re-applies them after boot (never via firewall includes or init.d).
+  `iif br-lan`. These resources remain runtime-only. The G2-C candidate tracks
+  the exact firewall and bypass resources inserted by its current manager
+  instance and removes only those leases; it does not sweep rule priorities,
+  flush table 2022, or delete the TUN device. Before any Mihomo start (TUN or
+  non-TUN), a read-only check rejects a matching rule, non-empty table 2022,
+  existing `mihomo` interface, or failed inspection. A force-killed process may
+  leave resources behind; startup then fails closed for owner inspection rather
+  than guessing their ownership. Nothing is installed through firewall
+  includes or init.d.
   The router's own traffic and management ports are never routed into the
   TUN, and the forwarding watchdog turns TUN off if mihomo stops forwarding.
   mihomo's controller listens on the LAN address (`:9097`, metacubexd at
   `/ui/`) with the subscription config's secret, or none; the wan zone rejects
-  input, so it is LAN-only. The agent uses the unix socket in `/data/mihomo`
-  (directory 0700).
+  input, so it is LAN-only. The candidate agent uses the unix socket under
+  `/data/u60-pro-managed/mihomo` (directory 0700), separate from legacy data.
   The mainland bypass adds one tagged mangle PREROUTING MARK rule (`-i br-lan`,
   ipset `mihomo-cn`, mark `0x10000000`), ip rule 8999 (`fwmark … lookup
-  main`) and the ipset itself; same lifecycle as the accepts.
+  main`) and the ipset itself. The candidate tracks only the exact resources it
+  created, checks the full rule signature at priority 8999, and leaves any
+  pre-existing or ambiguous resource in place.
 - `usb::enforce_usb_mode_on_boot()` rebuilds the USB configfs gadget **only
   if NCM was explicitly persisted** (`/data/local/tmp/usb_config.json`),
   waits up to 75 s for the stock USB stack to finish (bridge-membership
