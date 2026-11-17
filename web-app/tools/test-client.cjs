@@ -8,13 +8,14 @@ const ts = require('typescript')
 const i18nStub = {
   t: (text, vars) => (vars ? text.replace(/\{(\w+)\}/g, (m, k) => (k in vars ? String(vars[k]) : m)) : text),
 }
-function fixture() {
+function fixture(fetchImpl) {
   const requests = []
   const context = { exports: {}, require: () => i18nStub, AbortController, setTimeout, clearTimeout,
     window: { location: { hostname: '192.168.0.1' }, dispatchEvent: () => {} },
     sessionStorage: { getItem: () => 'general-session-secret', setItem: () => {}, removeItem: () => {} },
     fetch: async (url, options) => {
       requests.push({ url, options })
+      if (fetchImpl) return fetchImpl(url, options)
       return { ok: true, status: 200, json: async () => ({ ok: true, data: {} }) }
     },
   }
@@ -39,4 +40,26 @@ test('LAN confirmation rejects URLs and addresses outside private IPv4 space', a
     await assert.rejects(client.confirmLan(ip, 'nonce'), /Invalid LAN/)
   }
   assert.equal(requests.length, 0)
+})
+
+test('GET request timeout aborts a nonresponsive fetch', async () => {
+  const { client, requests } = fixture((_url, options) => new Promise((_resolve, reject) => {
+    options.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true })
+  }))
+  await assert.rejects(client.get('/api/proxy/groups', 20), /Timed out reaching the agent/)
+  assert.equal(requests.length, 1)
+  assert.equal(requests[0].options.signal.aborted, true)
+})
+
+test('caller cancellation aborts the underlying GET', async () => {
+  const { client, requests } = fixture((_url, options) => new Promise((_resolve, reject) => {
+    options.signal.addEventListener('abort', () => reject(Object.assign(new Error('aborted'), { name: 'AbortError' })), { once: true })
+  }))
+  const caller = new AbortController()
+  const request = client.get('/api/proxy/groups', 1000, caller.signal)
+  await new Promise((resolve) => setTimeout(resolve, 0))
+  caller.abort()
+  await assert.rejects(request, /Timed out reaching the agent/)
+  assert.equal(requests.length, 1)
+  assert.equal(requests[0].options.signal.aborted, true)
 })

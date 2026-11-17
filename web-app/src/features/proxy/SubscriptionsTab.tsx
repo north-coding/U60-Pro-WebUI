@@ -47,7 +47,7 @@ async function refreshSubscriptions(running: boolean, targets: UpdateTarget[], i
     start: async () => {
       await api.proxyService('start')
     },
-    waitUntilReady: () => waitForProxyReady(api.proxyGroups),
+    waitUntilReady: () => waitForProxyReady(({ signal, timeoutMs }) => api.proxyGroups(timeoutMs, signal)),
     refresh: () => api.proxySubscriptionUpdate(id),
   })
 }

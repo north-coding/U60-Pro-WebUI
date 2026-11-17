@@ -44,9 +44,13 @@ export async function req(
   timeoutMs = 15_000,
   base = API_BASE,
   sendToken = true,
+  externalSignal?: AbortSignal,
 ): Promise<Record<string, unknown>> {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), timeoutMs)
+  const abortFromCaller = () => controller.abort()
+  if (externalSignal?.aborted) controller.abort()
+  else externalSignal?.addEventListener('abort', abortFromCaller, { once: true })
   const headers: Record<string, string> = { ...(extraHeaders ?? {}) }
   if (_token && sendToken) headers['Authorization'] = `Bearer ${_token}`
   if (body !== undefined) headers['Content-Type'] = 'application/json'
@@ -60,7 +64,7 @@ export async function req(
         signal: controller.signal,
       })
     } catch (error) {
-      if (error instanceof Error && error.name === 'AbortError') {
+      if (error !== null && typeof error === 'object' && 'name' in error && error.name === 'AbortError') {
         throw new ApiError(t('Timed out reaching the agent'))
       }
       throw new ApiError(t('Failed to reach the agent at {address}', { address: API_BASE }))
@@ -82,10 +86,12 @@ export async function req(
     return (json.data ?? {}) as Record<string, unknown>
   } finally {
     clearTimeout(timeout)
+    externalSignal?.removeEventListener('abort', abortFromCaller)
   }
 }
 
-export const get = (path: string) => req('GET', path)
+export const get = (path: string, timeoutMs?: number, signal?: AbortSignal) =>
+  req('GET', path, undefined, undefined, timeoutMs, API_BASE, true, signal)
 export const post = (path: string, body?: unknown, extraHeaders?: Record<string, string>) =>
   req('POST', path, body, extraHeaders)
 export const put = (path: string, body: unknown) => req('PUT', path, body)

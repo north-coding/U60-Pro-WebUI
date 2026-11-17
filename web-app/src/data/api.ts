@@ -1137,7 +1137,7 @@ export const api = {
     req('POST', '/api/proxy/subscriptions/delete', { id }, { 'X-Confirm': 'true' }, 45_000),
   proxySubscriptionUpdate: (id?: string) =>
     req('POST', '/api/proxy/subscriptions/update', id ? { id } : {}, undefined, 180_000),
-  proxyGroups: () => get('/api/proxy/groups').then(mapProxyGroups),
+  proxyGroups: (timeoutMs?: number, signal?: AbortSignal) => get('/api/proxy/groups', timeoutMs, signal).then(mapProxyGroups),
   proxySelect: (group: string, proxy: string) => put('/api/proxy/groups', { group, proxy }),
   /** One group's members, or every node when `group` is omitted. */
   proxyDelay: (group?: string) =>
