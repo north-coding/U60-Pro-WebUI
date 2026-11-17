@@ -128,6 +128,46 @@ pub fn login(
     }
 }
 
+/// Password-only login for the isolated proxy management server.
+pub fn proxy_login(auth: &AuthState, body: &[u8], client_ip: &str) -> (u16, Value) {
+    let parsed: Value = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(_) => return (400, json!({"ok": false, "error": "invalid JSON"})),
+    };
+    let Some(object) = parsed.as_object() else {
+        return (400, json!({"ok": false, "error": "expected a JSON object"}));
+    };
+    if object.len() != 1 || !object.contains_key("password") {
+        return (
+            400,
+            json!({"ok": false, "error": "provide only the password field"}),
+        );
+    }
+    let Some(password) = parsed["password"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+    else {
+        return (
+            400,
+            json!({"ok": false, "error": "password must be a nonempty string"}),
+        );
+    };
+    if !auth.has_password() {
+        return (
+            403,
+            json!({"ok": false, "error": "no password configured for proxy-only mode"}),
+        );
+    }
+    match auth.login_password(password, client_ip) {
+        auth::LoginResult::Ok { token } => (200, json!({"ok": true, "data": {"token": token}})),
+        auth::LoginResult::Invalid => (401, json!({"ok": false, "error": "invalid credentials"})),
+        auth::LoginResult::Locked { retry_after_secs } => (
+            429,
+            json!({"ok": false, "error": format!("too many attempts, retry in {retry_after_secs}s")}),
+        ),
+    }
+}
+
 fn is_mobile_user_agent(user_agent: &str) -> bool {
     let ua = user_agent.to_ascii_lowercase();
     ua.contains("mobile")

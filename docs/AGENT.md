@@ -97,6 +97,38 @@ is a route below — `scripts/check-api-contract.py` enforces both directions
 
 ## Proxy (mihomo)
 
+### Isolated proxy-only startup
+
+The explicit `--proxy-only` startup mode parses and validates its arguments
+before the legacy Agent initializes. It requires a nonempty
+`ZTE_AGENT_PASSWORD`; it does not read the legacy startup script for secrets.
+The default listener is `127.0.0.1:9090`. A private IPv4 LAN bind requires an
+explicit `--proxy-bind ADDRESS:PORT --proxy-lan-confirm` pair and the same
+credential check. Unknown or conflicting arguments fail before startup.
+
+This mode constructs only password authentication and the Mihomo manager. It
+does not run migration cleanup, EventBus, charge or SMS workers, traffic
+logging, TTL scripts, USB enforcement, LAN recovery, or unrelated device
+service initialization. Only the login route and exact `/api/proxy/*`
+management methods are dispatched; every management request requires a valid
+Bearer token, and unrelated router routes return 404. CORS is limited to
+loopback origins or the dashboard origin at the configured private bind IP on
+port 8080. The LAN API bind uses port 9090 to match the existing WebUI
+contract. The password
+salt is stored at `/data/u60-pro-managed/auth/salt` (file mode 0600, directory
+mode 0700). Startup rejects a missing or unowned managed root, symlinked
+state, or Mihomo state/directory with permissive modes. A missing Mihomo
+directory is created only at its exact manifest path with mode 0700 when the
+first config is written.
+
+In this mode Mihomo's TCP controller and built-in panel are omitted from the
+rendered config; the Agent uses only the private managed Unix socket. The
+unauthenticated PAC endpoint is not exposed and `pac_url` is null. This
+prevents LAN clients from bypassing Agent authentication through Mihomo's
+otherwise unauthenticated controller. The zero-argument legacy startup keeps
+its existing behavior. The offline mode is not evidence of deployment or
+device readiness.
+
 `agent/src/mihomo/` manages one [mihomo](https://github.com/MetaCubeX/mihomo)
 instance under `/data/u60-pro-managed/mihomo`. This managed tree is separate
 from the abandoned legacy `/data/mihomo` tree. `scripts/deploy-mihomo.sh` still
@@ -135,6 +167,9 @@ owned paths.
   restarts mihomo instead, and
   at start the agent checks that the controller accepts the configured secret
   and restarts it if not.
+  This LAN TCP controller applies to the legacy startup mode only; proxy-only
+  mode removes the TCP controller and panel and keeps controller access on the
+  managed Unix socket.
 - **Listener**: the mixed HTTP/SOCKS port binds the LAN address only.
 - **Process**: started in its own session so agent restarts do not stop it;
   the current manager version can re-adopt a process only from its managed

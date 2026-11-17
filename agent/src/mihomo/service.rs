@@ -6,6 +6,8 @@
 //! never swept by generic priority or table cleanup.
 
 use std::fs::{self, OpenOptions};
+use std::io::{Read, Write};
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -32,6 +34,36 @@ pub struct Process {
     child: Option<Child>,
     pub pid: u32,
     pub started: Instant,
+    pid_file: FileIdentity,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
+    FileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    }
+}
+
+fn remove_pid_record(path: &str, expected_pid: u32, identity: FileIdentity) {
+    let Ok(metadata) = fs::metadata(path) else {
+        return;
+    };
+    if file_identity(&metadata) != identity {
+        return;
+    }
+    if fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| contents.trim().parse::<u32>().ok())
+        == Some(expected_pid)
+    {
+        let _ = fs::remove_file(path);
+    }
 }
 
 #[derive(Default)]
@@ -80,6 +112,109 @@ impl BypassLease {
 
 pub fn installed() -> bool {
     Path::new(BINARY).is_file()
+}
+
+/// Read-only indicator for a record that proxy-only mode will not adopt or
+/// overwrite. The caller should report the state as unverified.
+pub fn managed_pid_record_present() -> bool {
+    fs::symlink_metadata(PIDFILE).is_ok()
+}
+
+/// Validate existing proxy-only state without following symlinks or repairing
+/// unknown ownership. A missing Mihomo directory is allowed until a mutation
+/// needs to write its first managed config.
+pub fn validate_proxy_only_paths() -> Result<(), String> {
+    let root = Path::new(DIR)
+        .parent()
+        .ok_or_else(|| "managed Mihomo path has no runtime root".to_string())?;
+    validate_managed_tree(root, Path::new(DIR), Path::new(paths::MIHOMO_STATE))
+}
+
+/// Create only the exact Mihomo runtime directory under an already validated
+/// managed root, with private permissions for the Unix controller socket.
+pub fn ensure_proxy_only_runtime_dir() -> Result<(), String> {
+    let root = Path::new(DIR)
+        .parent()
+        .ok_or_else(|| "managed Mihomo path has no runtime root".to_string())?;
+    ensure_private_directory(root, Path::new(DIR))
+}
+
+fn validate_managed_tree(root: &Path, mihomo_dir: &Path, state_file: &Path) -> Result<(), String> {
+    if mihomo_dir.parent() != Some(root) || state_file.parent() != Some(mihomo_dir) {
+        return Err("managed Mihomo paths do not match the declared directory layout".into());
+    }
+    let root_metadata = fs::symlink_metadata(root)
+        .map_err(|error| format!("managed runtime root is unavailable: {error}"))?;
+    if root_metadata.file_type().is_symlink()
+        || !root_metadata.is_dir()
+        || root_metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Err("managed runtime root has unexpected type or owner".into());
+    }
+
+    let directory_metadata = match fs::symlink_metadata(mihomo_dir) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(format!("cannot inspect managed Mihomo directory: {error}")),
+    };
+    validate_private_directory(mihomo_dir, &directory_metadata)?;
+
+    match fs::symlink_metadata(state_file) {
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.nlink() != 1
+                || metadata.mode() & 0o7777 != 0o600 =>
+        {
+            Err("managed Mihomo state has unexpected type, owner, links, or permissions".into())
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("cannot inspect managed Mihomo state: {error}")),
+    }
+}
+
+fn ensure_private_directory(root: &Path, mihomo_dir: &Path) -> Result<(), String> {
+    if mihomo_dir.parent() != Some(root) {
+        return Err("managed Mihomo directory is outside the declared runtime root".into());
+    }
+    let root_metadata = fs::symlink_metadata(root)
+        .map_err(|error| format!("managed runtime root is unavailable: {error}"))?;
+    if root_metadata.file_type().is_symlink()
+        || !root_metadata.is_dir()
+        || root_metadata.uid() != unsafe { libc::geteuid() }
+    {
+        return Err("managed runtime root has unexpected type or owner".into());
+    }
+    match fs::symlink_metadata(mihomo_dir) {
+        Ok(metadata) => validate_private_directory(mihomo_dir, &metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut builder = fs::DirBuilder::new();
+            builder.mode(0o700);
+            builder
+                .create(mihomo_dir)
+                .map_err(|error| format!("cannot create managed Mihomo directory: {error}"))?;
+            let metadata = fs::symlink_metadata(mihomo_dir)
+                .map_err(|error| format!("cannot verify managed Mihomo directory: {error}"))?;
+            validate_private_directory(mihomo_dir, &metadata)
+        }
+        Err(error) => Err(format!("cannot inspect managed Mihomo directory: {error}")),
+    }
+}
+
+fn validate_private_directory(path: &Path, metadata: &fs::Metadata) -> Result<(), String> {
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o7777 != 0o700
+    {
+        return Err(format!(
+            "managed directory {} has unexpected type, owner, or permissions",
+            path.display()
+        ));
+    }
+    Ok(())
 }
 
 /// `Mihomo Meta v1.19.32 linux arm64 …` → `v1.19.32`.
@@ -148,6 +283,21 @@ pub fn spawn() -> Result<Process, String> {
     let log_err = log
         .try_clone()
         .map_err(|e| format!("cannot open {LOG}: {e}"))?;
+    // Never overwrite a record left by another Agent. Proxy-only mode does not
+    // adopt or clean up an existing PID record, so this also fails closed on
+    // stale or unverifiable state.
+    let mut pid_record = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(PIDFILE)
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!("managed PID record already exists at {PIDFILE}; refusing to adopt or overwrite it")
+            } else {
+                format!("cannot reserve managed PID record {PIDFILE}: {error}")
+            }
+        })?;
     let mut cmd = Command::new(BINARY);
     cmd.args(["-d", DIR, "-f", CONFIG])
         .env("GOMEMLIMIT", "160MiB")
@@ -161,23 +311,58 @@ pub fn spawn() -> Result<Process, String> {
             Ok(())
         });
     }
-    let child = cmd
-        .spawn()
-        .map_err(|e| format!("failed to start mihomo: {e}"))?;
+    let child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(error) => {
+            remove_reserved_pid_record(&pid_record);
+            return Err(format!("failed to start mihomo: {error}"));
+        }
+    };
     let pid = child.id();
-    let _ = fs::write(PIDFILE, format!("{pid}\n"));
+    if let Err(error) = writeln!(pid_record, "{pid}").and_then(|_| pid_record.sync_all()) {
+        let mut child = child;
+        let _ = child.kill();
+        let _ = child.wait();
+        remove_reserved_pid_record(&pid_record);
+        return Err(format!("cannot write managed PID record: {error}"));
+    }
+    let pid_file = match pid_record.metadata() {
+        Ok(metadata) => file_identity(&metadata),
+        Err(error) => {
+            let mut child = child;
+            let _ = child.kill();
+            let _ = child.wait();
+            remove_reserved_pid_record(&pid_record);
+            return Err(format!("cannot verify managed PID record: {error}"));
+        }
+    };
     Ok(Process {
         child: Some(child),
         pid,
         started: Instant::now(),
+        pid_file,
     })
+}
+
+fn remove_reserved_pid_record(file: &fs::File) {
+    let Ok(owned) = file.metadata() else { return };
+    let Ok(current) = fs::metadata(PIDFILE) else {
+        return;
+    };
+    if owned.dev() == current.dev() && owned.ino() == current.ino() {
+        let _ = fs::remove_file(PIDFILE);
+    }
 }
 
 /// Re-attach to a mihomo started by a previous agent instance.
 pub fn adopt() -> Option<Process> {
-    let pid: u32 = fs::read_to_string(PIDFILE).ok()?.trim().parse().ok()?;
+    let record = fs::File::open(PIDFILE).ok()?;
+    let identity = file_identity(&record.metadata().ok()?);
+    let mut contents = String::new();
+    record.take(128).read_to_string(&mut contents).ok()?;
+    let pid: u32 = contents.trim().parse().ok()?;
     if !pid_is_mihomo(pid) {
-        let _ = fs::remove_file(PIDFILE);
+        remove_pid_record(PIDFILE, pid, identity);
         return None;
     }
     let started = process_age(pid)
@@ -187,6 +372,7 @@ pub fn adopt() -> Option<Process> {
         child: None,
         pid,
         started,
+        pid_file: identity,
     })
 }
 
@@ -247,24 +433,51 @@ impl Process {
         Some(kb * 1024)
     }
 
+    /// Clear this manager's PID record only after its child handle confirms
+    /// that the process exited. Used for a failed immediate start.
+    pub fn clear_pidfile_if_child_exited(&mut self) {
+        if self
+            .child
+            .as_mut()
+            .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_))))
+        {
+            remove_pid_record(PIDFILE, self.pid, self.pid_file);
+        }
+    }
+
     /// SIGTERM, wait up to 5 s, then SIGKILL. A forced exit can leave TUN
     /// routing resources; the next start detects them and fails closed.
     pub fn terminate(mut self) -> bool {
+        if self
+            .child
+            .as_mut()
+            .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_))))
+        {
+            remove_pid_record(PIDFILE, self.pid, self.pid_file);
+            return false;
+        }
+        if self.child.is_none() && !pid_is_mihomo(self.pid) {
+            return false;
+        }
         let pid = self.pid as libc::pid_t;
         unsafe { libc::kill(pid, libc::SIGTERM) };
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
             if !self.alive() {
-                let _ = fs::remove_file(PIDFILE);
+                remove_pid_record(PIDFILE, self.pid, self.pid_file);
                 return false;
             }
             std::thread::sleep(Duration::from_millis(100));
+        }
+        if !self.alive() {
+            remove_pid_record(PIDFILE, self.pid, self.pid_file);
+            return false;
         }
         unsafe { libc::kill(pid, libc::SIGKILL) };
         if let Some(mut child) = self.child.take() {
             let _ = child.wait();
         }
-        let _ = fs::remove_file(PIDFILE);
+        remove_pid_record(PIDFILE, self.pid, self.pid_file);
         true
     }
 }
@@ -776,6 +989,63 @@ pub fn address_ready(ip: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn proxy_only_runtime_paths_require_owned_private_paths() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "u60-managed-paths-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let mihomo_dir = root.join("mihomo");
+        let state_file = mihomo_dir.join("manager.json");
+        assert!(validate_managed_tree(&root, &mihomo_dir, &state_file).is_ok());
+
+        ensure_private_directory(&root, &mihomo_dir).unwrap();
+        assert_eq!(fs::metadata(&mihomo_dir).unwrap().mode() & 0o777, 0o700);
+        fs::write(&state_file, b"{}\n").unwrap();
+        fs::set_permissions(&state_file, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(validate_managed_tree(&root, &mihomo_dir, &state_file).is_ok());
+
+        fs::set_permissions(&state_file, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(validate_managed_tree(&root, &mihomo_dir, &state_file).is_err());
+        fs::set_permissions(&state_file, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::remove_file(&state_file).unwrap();
+        let external_state = root.join("outside.json");
+        fs::write(&external_state, b"{}\n").unwrap();
+        std::os::unix::fs::symlink(&external_state, &state_file).unwrap();
+        assert!(validate_managed_tree(&root, &mihomo_dir, &state_file).is_err());
+        fs::remove_file(&state_file).unwrap();
+        fs::remove_dir(&mihomo_dir).unwrap();
+        fs::create_dir(&mihomo_dir).unwrap();
+        fs::set_permissions(&mihomo_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(validate_managed_tree(&root, &mihomo_dir, &state_file).is_err());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn pid_record_cleanup_requires_matching_file_identity_and_pid() {
+        let root = std::env::temp_dir().join(format!("u60-pid-record-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).unwrap();
+        let path = root.join("mihomo.pid");
+        let replacement = root.join("replacement.pid");
+        fs::write(&path, "123\n").unwrap();
+        let old_identity = file_identity(&fs::metadata(&path).unwrap());
+        fs::write(&replacement, "456\n").unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        remove_pid_record(path.to_str().unwrap(), 123, old_identity);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "456\n");
+
+        let identity = file_identity(&fs::metadata(&path).unwrap());
+        remove_pid_record(path.to_str().unwrap(), 456, identity);
+        assert!(!path.exists());
+        let _ = fs::remove_dir_all(root);
+    }
 
     #[test]
     fn cn_list_keeps_ipv4_prefixes_only() {

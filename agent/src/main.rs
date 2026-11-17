@@ -20,6 +20,7 @@ mod netselect;
 mod netsvc;
 mod network_ext;
 mod process;
+mod proxy_only;
 mod router;
 mod schedule;
 mod server;
@@ -27,6 +28,7 @@ mod signal_logger;
 mod sim;
 mod sms;
 mod sms_forward;
+mod startup;
 mod storage;
 mod system;
 mod ubus;
@@ -46,6 +48,25 @@ const DEFAULT_THREADS: usize = 4;
 const STARTUP_SCRIPT: &str = "/data/local/tmp/start_zte_agent.sh";
 
 fn main() {
+    let mode = match startup::parse(std::env::args().skip(1)) {
+        Ok(mode) => mode,
+        Err(error) => {
+            eprintln!("[agent] invalid startup arguments: {error}");
+            eprintln!("[agent] usage: zte-agent [--proxy-only [--proxy-bind IPV4:PORT --proxy-lan-confirm]]");
+            std::process::exit(64);
+        }
+    };
+
+    startup::dispatch(mode, legacy_main, |bind| {
+        if let Err(error) = proxy_only::run(bind) {
+            eprintln!("[agent] proxy-only startup failed: {error}");
+            std::process::exit(1);
+        }
+    });
+}
+
+/// Preserve the existing zero-argument startup behavior for the legacy Agent.
+fn legacy_main() {
     diag_log::init();
     eprintln!(
         "[agent] zte-agent {} starting (pid {})",
