@@ -134,8 +134,12 @@ class FixtureShapes(MockCase):
         routes = re.findall(r'\(&Method::(\w+),\s*"(/api/[^"]+)"\)', server_rs)
         self.assertGreater(len(routes), 40)
         for method, path in routes:
-            status, _, _ = self.raw(method.upper(), path, {} if method != 'Get' else None)
-            self.assertNotEqual(status, 404, f'{method} {path}')
+            status, _, response = self.raw(method.upper(), path, {} if method != 'Get' else None)
+            # A registered endpoint may legitimately return 404 for an absent
+            # resource (for example, deleting a rule that does not exist).
+            # Only the mock router's exact unknown-route error means missing.
+            if status == 404:
+                self.assertNotEqual(json.loads(response).get('error'), 'not found', f'{method} {path}')
             self.call('POST', '/__mock/reset')  # keep one route from affecting the next
 
 
