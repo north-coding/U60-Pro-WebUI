@@ -23,6 +23,14 @@ Owner: north-coding. Development host: Mac Dev only. This ledger tracks **tempor
 | `/tmp/u60-g1a-after-rebase-tests-20261117.log` | G1-A | Final host-side Python 80/80 tests after branch rebase | PENDING_CLEANUP | After G1-A PR completion |
 | `/tmp/u60-g1a-pr-body-20261117.md` | G1-A | Draft PR #2 description and scope | PENDING_CLEANUP | After PR #2 completion |
 
-Next review: after G1-A Draft PR review, before any G1-B device-facing SSH installer work. Only the Owner-approved lifecycle may authorize deleting authoritative evidence or worktrees with unresolved recovery value. **No cleanup performed in G0/G1-A.**
+| `/Users/north/Developer/Worktrees/u60-pro-webui-g1b-20261117` | G1-B | Isolated offline coexistence planner, synthetic tests and architecture; stacked on G1-A | RETAIN / DRAFT_CANDIDATE | After G1-B PR lifecycle decision |
+| `/tmp/u60-g1a-focused-notice-contract-20261117.md` | G1-A | Scoped CLI authorization notice task | PENDING_CLEANUP | After PR #2 lifecycle decision |
+| `/tmp/u60-g1a-focused-notice-codex-20261117.log` | G1-A | Implementation agent record and sandbox limitation | PENDING_CLEANUP | After PR #2 lifecycle decision |
+| `/tmp/u60-g1a-full-local-after-notice-20261117.log` | G1-A | 81/81 host-side Python test evidence | PENDING_CLEANUP | After PR #2 lifecycle decision |
+| `/tmp/u60-g1b-offline-contract-20261117.md` | G1-B | Scoped design / offline implementation task contract | PENDING_CLEANUP | After G1-B PR lifecycle decision |
+| `/tmp/u60-g1b-offline-codex-20261117.log` | G1-B | Partial agent execution evidence; session terminated after prolonged inactivity; resulting files separately verified | PENDING_CLEANUP | After G1-B PR lifecycle decision |
+| `/tmp/u60-g1b-local-tests-20261117.log` | G1-B | Local offline and regression test evidence (when generated) | PENDING_CLEANUP | After G1-B PR lifecycle decision |
+
+Next review: after G1-B offline focused audit; before any G1-B device-facing SSH installer work. Only the Owner-approved lifecycle may authorize deleting authoritative evidence or worktrees with unresolved recovery value. **No cleanup performed in G0/G1-A.**
 
 No GitHub Actions/CI is authorized; local tests and proportionate independent review are the evidence source.
