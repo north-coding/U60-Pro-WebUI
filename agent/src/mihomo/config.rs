@@ -274,6 +274,23 @@ pub fn render(
     Ok(config)
 }
 
+/// Render the same proxy configuration for the authenticated proxy-only Agent,
+/// but keep Mihomo's management API on its Unix socket only. This prevents a
+/// second, unauthenticated LAN management surface from bypassing the Agent.
+pub fn render_proxy_only(
+    state: &State,
+    lan_ip: &str,
+    profile: Option<&Value>,
+) -> Result<Value, String> {
+    let mut config = render(state, lan_ip, profile, false)?;
+    if let Some(object) = config.as_object_mut() {
+        object.remove("external-controller");
+        object.remove("external-ui");
+        object.remove("secret");
+    }
+    Ok(config)
+}
+
 /// The controller secret a subscription config sets ("" when none).
 pub fn profile_secret(base: &Value) -> String {
     match base.get("secret") {
@@ -508,6 +525,15 @@ mod tests {
         assert!(c.get("external-ui").is_none());
         let with_ui = render(&state, "192.168.0.1", None, true).unwrap();
         assert_eq!(with_ui["external-ui"], "ui");
+    }
+
+    #[test]
+    fn proxy_only_config_exposes_controller_only_on_unix_socket() {
+        let c = render_proxy_only(&State::default(), "192.168.0.1", None).unwrap();
+        assert!(c.get("external-controller").is_none());
+        assert!(c.get("external-ui").is_none());
+        assert!(c.get("secret").is_none());
+        assert_eq!(c["external-controller-unix"], CONTROLLER_SOCKET);
     }
 
     #[test]

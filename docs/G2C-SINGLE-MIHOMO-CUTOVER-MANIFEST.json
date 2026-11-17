@@ -77,6 +77,8 @@
       {"id": "managed-agent-dir", "path": "/data/u60-pro-managed/agent", "kind": "directory", "classification": "project_owned", "owner_id": "u60-proxy-agent"},
       {"id": "managed-agent-binary", "path": "/data/u60-pro-managed/agent/zte-agent", "kind": "file", "classification": "project_owned", "owner_id": "u60-proxy-agent"},
       {"id": "managed-agent-startup", "path": "/data/u60-pro-managed/agent/start-proxy-agent.sh", "kind": "file", "classification": "project_owned", "owner_id": "u60-proxy-agent"},
+      {"id": "managed-auth-dir", "path": "/data/u60-pro-managed/auth", "kind": "directory", "classification": "project_owned", "owner_id": "u60-proxy-agent"},
+      {"id": "managed-auth-salt", "path": "/data/u60-pro-managed/auth/salt", "kind": "file", "classification": "project_owned", "owner_id": "u60-proxy-agent"},
       {"id": "managed-mihomo-dir", "path": "/data/u60-pro-managed/mihomo", "kind": "directory", "classification": "mihomo_owned", "owner_id": "managed-mihomo"},
       {"id": "managed-mihomo-binary", "path": "/data/u60-pro-managed/mihomo/mihomo", "kind": "file", "classification": "mihomo_owned", "owner_id": "managed-mihomo"},
       {"id": "managed-mihomo-config", "path": "/data/u60-pro-managed/mihomo/config.yaml", "kind": "file", "classification": "mihomo_owned", "owner_id": "managed-mihomo"},

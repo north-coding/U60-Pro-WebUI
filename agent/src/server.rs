@@ -1,7 +1,9 @@
 use crate::process::BoundedCommand;
+use std::io::Read;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
+use std::{net::SocketAddr, thread};
 
 use serde_json::{json, Value};
 use tiny_http::{Header, Method, Request, Response, Server};
@@ -17,6 +19,7 @@ use crate::handlers::{self, AppState};
 use crate::netselect;
 use crate::netsvc;
 use crate::network_ext;
+use crate::proxy_only::ProxyOnlyState;
 use crate::router;
 use crate::schedule;
 use crate::signal_logger;
@@ -98,6 +101,305 @@ pub fn start(threads: usize, state: Arc<AppState>) {
         std::thread::sleep(retry);
         retry = (retry * 2).min(RETRY_MAX);
     }
+}
+
+/// Minimal API listener used only by `--proxy-only`. It constructs no legacy
+/// AppState and dispatches only the explicit proxy-management allowlist.
+pub fn start_proxy_only(bind: SocketAddr, state: Arc<ProxyOnlyState>) -> Result<(), String> {
+    let server = Server::http(bind.to_string())
+        .map_err(|error| format!("could not bind proxy-only API on {bind}: {error}"))?;
+    eprintln!("[proxy-only] API listening on {bind}");
+    state.mihomo.start_watchdog();
+
+    let server = Arc::new(server);
+    let failed = Arc::new(AtomicBool::new(false));
+    let mut workers = Vec::new();
+    for _ in 0..4 {
+        let server = Arc::clone(&server);
+        let state = Arc::clone(&state);
+        let failed = Arc::clone(&failed);
+        workers.push(thread::spawn(move || loop {
+            if failed.load(Ordering::Relaxed) {
+                return;
+            }
+            match server.recv_timeout(WORKER_POLL) {
+                Ok(Some(request)) => handle_proxy_only_request(request, &state, bind),
+                Ok(None) => {}
+                Err(error) => {
+                    eprintln!("[proxy-only] listener failed: {error}");
+                    failed.store(true, Ordering::Relaxed);
+                    return;
+                }
+            }
+        }));
+    }
+    for worker in workers {
+        let _ = worker.join();
+    }
+    Err(format!("proxy-only listener on {bind} stopped"))
+}
+
+fn proxy_only_methods(path: &str) -> Option<&'static [&'static str]> {
+    match path {
+        "/api/auth/login" => Some(&["POST"]),
+        "/api/proxy/status" => Some(&["GET"]),
+        "/api/proxy/settings" => Some(&["PUT"]),
+        "/api/proxy/service" => Some(&["POST"]),
+        "/api/proxy/subscriptions" => Some(&["GET", "POST", "PUT"]),
+        "/api/proxy/subscriptions/delete" | "/api/proxy/subscriptions/update" => Some(&["POST"]),
+        "/api/proxy/groups" => Some(&["GET", "PUT"]),
+        "/api/proxy/delay" => Some(&["POST"]),
+        _ => None,
+    }
+}
+
+fn proxy_only_origin_allowed(origin: &str, bind: SocketAddr) -> bool {
+    let Some(authority) = origin.strip_prefix("http://") else {
+        return false;
+    };
+    if authority.is_empty()
+        || authority
+            .bytes()
+            .any(|byte| matches!(byte, b'/' | b'?' | b'#' | b'@' | b' ' | b'\\'))
+    {
+        return false;
+    }
+    let (host, port) = if let Some((host, port)) = authority.rsplit_once(':') {
+        if host.contains(':') || port.parse::<u16>().ok().filter(|p| *p != 0).is_none() {
+            return false;
+        }
+        (host, port.parse::<u16>().ok())
+    } else {
+        (authority, None)
+    };
+
+    let bound_ip = match bind.ip() {
+        std::net::IpAddr::V4(ip) => ip,
+        std::net::IpAddr::V6(_) => return false,
+    };
+    if bound_ip.is_loopback() {
+        host.eq_ignore_ascii_case("localhost")
+            || host
+                .parse::<std::net::Ipv4Addr>()
+                .is_ok_and(|ip| ip.is_loopback())
+    } else {
+        host.parse::<std::net::Ipv4Addr>().ok() == Some(bound_ip) && port == Some(8080)
+    }
+}
+
+fn proxy_only_request_header<'a>(request: &'a Request, name: &'static str) -> Option<&'a str> {
+    request
+        .headers()
+        .iter()
+        .find(|header| header.field.equiv(name))
+        .map(|header| header.value.as_str())
+}
+
+fn handle_proxy_only_request(mut request: Request, state: &ProxyOnlyState, bind: SocketAddr) {
+    let method = request.method().clone();
+    let method_name = method.as_str();
+    let url = request.url().to_string();
+    let path = url.split('?').next().unwrap_or(&url);
+    let Some(allowed_methods) = proxy_only_methods(path) else {
+        respond_proxy_only(
+            request,
+            404,
+            json!({"ok": false, "error": "not found"}),
+            None,
+        );
+        return;
+    };
+
+    let origin = proxy_only_request_header(&request, "Origin").map(str::to_string);
+    let origin_ref = origin.as_deref();
+    if let Some(origin) = origin_ref {
+        if !proxy_only_origin_allowed(origin, bind) {
+            respond_proxy_only(
+                request,
+                403,
+                json!({"ok": false, "error": "origin is not allowed"}),
+                None,
+            );
+            return;
+        }
+    }
+
+    if method == Method::Options {
+        let requested = proxy_only_request_header(&request, "Access-Control-Request-Method");
+        let requested_headers =
+            proxy_only_request_header(&request, "Access-Control-Request-Headers").unwrap_or("");
+        let headers_allowed = requested_headers.split(',').all(|header| {
+            matches!(
+                header.trim().to_ascii_lowercase().as_str(),
+                "" | "authorization" | "content-type" | "x-confirm"
+            )
+        });
+        if origin_ref.is_none()
+            || !headers_allowed
+            || !requested.is_some_and(|name| allowed_methods.contains(&name))
+        {
+            respond_proxy_only(
+                request,
+                403,
+                json!({"ok": false, "error": "preflight request is not allowed"}),
+                None,
+            );
+            return;
+        }
+        let response = proxy_only_cors_response(Response::empty(204), origin_ref, allowed_methods);
+        let _ = request.respond(response);
+        return;
+    }
+
+    if !allowed_methods.contains(&method_name) {
+        let response = proxy_only_response(
+            Response::from_string(json!({"ok": false, "error": "method not allowed"}).to_string())
+                .with_status_code(405),
+            origin_ref,
+        )
+        .with_header(Header::from_bytes("Allow", allowed_methods.join(", ")).unwrap());
+        let _ = request.respond(response);
+        return;
+    }
+
+    let client_ip = request
+        .remote_addr()
+        .map(|address| address.ip().to_string())
+        .unwrap_or_else(|| "unknown".into());
+    let login = path == "/api/auth/login";
+    if !login {
+        if !state.auth.has_password() {
+            respond_proxy_only(
+                request,
+                403,
+                json!({"ok": false, "error": "no password configured"}),
+                origin_ref,
+            );
+            return;
+        }
+        let valid = proxy_only_request_header(&request, "Authorization")
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|token| state.auth.validate(token));
+        if !valid {
+            respond_proxy_only(
+                request,
+                401,
+                json!({"ok": false, "error": "unauthorized"}),
+                origin_ref,
+            );
+            return;
+        }
+    }
+
+    if path == "/api/proxy/subscriptions/delete"
+        && proxy_only_request_header(&request, "X-Confirm") != Some("true")
+    {
+        respond_proxy_only(
+            request,
+            400,
+            json!({"ok": false, "error": "destructive action requires X-Confirm: true header"}),
+            origin_ref,
+        );
+        return;
+    }
+
+    let mut body = Vec::new();
+    let read_result = {
+        let mut reader = request.as_reader();
+        std::io::Read::take(&mut reader, 1024 * 1024 + 1).read_to_end(&mut body)
+    };
+    if let Err(error) = read_result {
+        respond_proxy_only(
+            request,
+            400,
+            json!({"ok": false, "error": format!("failed to read body: {error}")}),
+            origin_ref,
+        );
+        return;
+    }
+    if body.len() > 1024 * 1024 {
+        respond_proxy_only(
+            request,
+            413,
+            json!({"ok": false, "error": "request body exceeds 1 MiB"}),
+            origin_ref,
+        );
+        return;
+    }
+
+    let (status, response_body) = if login {
+        handlers::proxy_login(&state.auth, &body, &client_ip)
+    } else {
+        proxy_only_route(&method, path, &state.mihomo, &body)
+    };
+    respond_proxy_only(request, status, response_body, origin_ref);
+}
+
+fn proxy_only_route(
+    method: &Method,
+    path: &str,
+    mihomo: &crate::mihomo::Manager,
+    body: &[u8],
+) -> (u16, Value) {
+    match (method, path) {
+        (&Method::Get, "/api/proxy/status") => mihomo.status(),
+        (&Method::Put, "/api/proxy/settings") => mihomo.settings_set(body),
+        (&Method::Post, "/api/proxy/service") => mihomo.service(body),
+        (&Method::Get, "/api/proxy/subscriptions") => mihomo.subscriptions(),
+        (&Method::Post, "/api/proxy/subscriptions") => mihomo.subscription_add(body),
+        (&Method::Put, "/api/proxy/subscriptions") => mihomo.subscription_edit(body),
+        (&Method::Post, "/api/proxy/subscriptions/delete") => mihomo.subscription_delete(body),
+        (&Method::Post, "/api/proxy/subscriptions/update") => mihomo.subscription_refresh(body),
+        (&Method::Get, "/api/proxy/groups") => mihomo.groups(),
+        (&Method::Put, "/api/proxy/groups") => mihomo.group_select(body),
+        (&Method::Post, "/api/proxy/delay") => mihomo.delay(body),
+        _ => (404, json!({"ok": false, "error": "not found"})),
+    }
+}
+
+fn proxy_only_response(
+    response: Response<std::io::Cursor<Vec<u8>>>,
+    origin: Option<&str>,
+) -> Response<std::io::Cursor<Vec<u8>>> {
+    let mut response = response
+        .with_header(Header::from_bytes("Content-Type", "application/json; charset=utf-8").unwrap())
+        .with_header(Header::from_bytes("Cache-Control", "no-store").unwrap())
+        .with_header(Header::from_bytes("X-Content-Type-Options", "nosniff").unwrap());
+    if let Some(origin) = origin {
+        response = response
+            .with_header(Header::from_bytes("Access-Control-Allow-Origin", origin).unwrap())
+            .with_header(Header::from_bytes("Vary", "Origin").unwrap());
+    }
+    response
+}
+
+fn proxy_only_cors_response<R: Read>(
+    mut response: Response<R>,
+    origin: Option<&str>,
+    allowed_methods: &[&str],
+) -> Response<R> {
+    if let Some(origin) = origin {
+        response = response
+            .with_header(Header::from_bytes("Access-Control-Allow-Origin", origin).unwrap())
+            .with_header(Header::from_bytes("Vary", "Origin").unwrap());
+    }
+    response
+        .with_header(
+            Header::from_bytes("Access-Control-Allow-Methods", allowed_methods.join(", ")).unwrap(),
+        )
+        .with_header(
+            Header::from_bytes(
+                "Access-Control-Allow-Headers",
+                "Authorization, Content-Type, X-Confirm",
+            )
+            .unwrap(),
+        )
+        .with_header(Header::from_bytes("Access-Control-Max-Age", "600").unwrap())
+}
+
+fn respond_proxy_only(request: Request, status: u16, body: Value, origin: Option<&str>) {
+    let response = Response::from_string(body.to_string()).with_status_code(status);
+    let _ = request.respond(proxy_only_response(response, origin));
 }
 
 const DESTRUCTIVE_PATHS: &[&str] = &[
@@ -702,7 +1004,125 @@ fn respond(request: Request, status: u16, body: Value, origin: Option<&str>) {
 
 #[cfg(test)]
 mod tests {
-    use super::is_at_command_allowed;
+    use super::{handle_proxy_only_request, is_at_command_allowed};
+    use crate::proxy_only::ProxyOnlyState;
+    use std::io::{Read, Write};
+    use std::net::{SocketAddr, TcpStream};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::thread::{self, JoinHandle};
+    use std::time::Duration;
+    use tiny_http::Server;
+
+    struct SmokeServer {
+        address: SocketAddr,
+        stop: Arc<AtomicBool>,
+        worker: Option<JoinHandle<()>>,
+        root: std::path::PathBuf,
+    }
+
+    impl Drop for SmokeServer {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::Relaxed);
+            if let Some(worker) = self.worker.take() {
+                let _ = worker.join();
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn smoke_server() -> SmokeServer {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "u60-proxy-http-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        let state_file = root.join("mihomo/manager.json");
+        std::fs::create_dir_all(state_file.parent().unwrap()).unwrap();
+        let saved_state = serde_json::json!({
+            "settings": {
+                "enabled": false,
+                "mode": "rule",
+                "preset": "bypass_cn",
+                "tun": false,
+                "cn_bypass": true,
+                "mixed_port": 7890,
+                "profile": null
+            },
+            "subscriptions": [{
+                "id": "a1b2c3d4",
+                "name": "synthetic-provider",
+                "url": "https://provider.invalid/synthetic-token",
+                "enabled": true,
+                "interval_hours": 0,
+                "fetched": null
+            }],
+            "secret": "synthetic-controller-secret"
+        });
+        let bytes = serde_json::to_vec_pretty(&saved_state).unwrap();
+        crate::storage::atomic_write(&state_file, &bytes).unwrap();
+        let state = Arc::new(
+            ProxyOnlyState::new_for_test("synthetic-password", &root.join("auth/salt"), state_file)
+                .unwrap(),
+        );
+        let server = Arc::new(Server::http("127.0.0.1:0").unwrap());
+        let address = server.server_addr().to_ip().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_server = Arc::clone(&server);
+        let worker_state = Arc::clone(&state);
+        let worker_stop = Arc::clone(&stop);
+        let worker = thread::spawn(move || {
+            while !worker_stop.load(Ordering::Relaxed) {
+                match worker_server.recv_timeout(Duration::from_millis(25)) {
+                    Ok(Some(request)) => handle_proxy_only_request(request, &worker_state, address),
+                    Ok(None) => {}
+                    Err(_) => return,
+                }
+            }
+        });
+        SmokeServer {
+            address,
+            stop,
+            worker: Some(worker),
+            root,
+        }
+    }
+
+    fn http(
+        address: SocketAddr,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: &str,
+    ) -> (u16, String, String) {
+        let mut stream = TcpStream::connect(address).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        write!(
+            stream,
+            "{method} {path} HTTP/1.1\r\nHost: {address}\r\nConnection: close\r\nContent-Length: {}\r\n",
+            body.len()
+        )
+        .unwrap();
+        for (name, value) in headers {
+            write!(stream, "{name}: {value}\r\n").unwrap();
+        }
+        stream.write_all(b"\r\n").unwrap();
+        stream.write_all(body.as_bytes()).unwrap();
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).unwrap();
+        let response = String::from_utf8_lossy(&response).into_owned();
+        let status = response
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|value| value.parse().ok())
+            .unwrap();
+        let (headers, body) = response.split_once("\r\n\r\n").unwrap_or((&response, ""));
+        (status, headers.to_string(), body.to_string())
+    }
 
     #[test]
     fn at_allowlist_is_exact_and_read_only() {
@@ -713,5 +1133,181 @@ mod tests {
         assert!(!is_at_command_allowed("AT+FOO"));
         assert!(!is_at_command_allowed("AT+CFUN=1"));
         assert!(!is_at_command_allowed("AT^RESET"));
+    }
+
+    #[test]
+    fn proxy_only_http_authenticates_and_serves_synthetic_subscription_state() {
+        let server = smoke_server();
+
+        assert_eq!(
+            http(server.address, "GET", "/api/proxy/subscriptions", &[], "").0,
+            401
+        );
+        assert_eq!(
+            http(server.address, "POST", "/api/proxy/service", &[], "{}").0,
+            401
+        );
+        assert_eq!(
+            http(
+                server.address,
+                "POST",
+                "/api/auth/login",
+                &[("Content-Type", "application/json")],
+                r#"{"password":"wrong"}"#,
+            )
+            .0,
+            401
+        );
+        let (status, _, login_body) = http(
+            server.address,
+            "POST",
+            "/api/auth/login",
+            &[("Content-Type", "application/json")],
+            r#"{"password":"synthetic-password"}"#,
+        );
+        assert_eq!(status, 200);
+        let token = serde_json::from_str::<serde_json::Value>(&login_body).unwrap()["data"]
+            ["token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let authorization = format!("Bearer {token}");
+
+        let (status, _, subscriptions_body) = http(
+            server.address,
+            "GET",
+            "/api/proxy/subscriptions",
+            &[("Authorization", &authorization)],
+            "",
+        );
+        assert_eq!(status, 200);
+        let subscriptions = serde_json::from_str::<serde_json::Value>(&subscriptions_body).unwrap();
+        assert_eq!(subscriptions["data"]["subscriptions"][0]["id"], "a1b2c3d4");
+        assert_eq!(
+            subscriptions["data"]["subscriptions"][0]["name"],
+            "synthetic-provider"
+        );
+
+        assert_eq!(
+            http(
+                server.address,
+                "GET",
+                "/api/wifi/status",
+                &[("Authorization", &authorization)],
+                "",
+            )
+            .0,
+            404
+        );
+        assert_eq!(
+            http(
+                server.address,
+                "PUT",
+                "/api/proxy/status",
+                &[("Authorization", &authorization)],
+                "{}",
+            )
+            .0,
+            405
+        );
+        assert_eq!(
+            http(
+                server.address,
+                "GET",
+                "/api/proxy/subscriptions",
+                &[("Authorization", "Bearer invalid-token")],
+                "",
+            )
+            .0,
+            401
+        );
+        assert_eq!(
+            http(
+                server.address,
+                "POST",
+                "/api/proxy/service",
+                &[
+                    ("Authorization", &authorization),
+                    ("Content-Type", "application/json"),
+                ],
+                r#"{"action":"unsupported"}"#,
+            )
+            .0,
+            400
+        );
+        assert_eq!(
+            http(
+                server.address,
+                "POST",
+                "/api/auth/login",
+                &[("Content-Type", "application/json")],
+                r#"{"pin":"123456"}"#,
+            )
+            .0,
+            400
+        );
+    }
+
+    #[test]
+    fn proxy_only_http_restricts_cross_origin_and_preflight_methods() {
+        let server = smoke_server();
+        let (status, headers, _) = http(
+            server.address,
+            "GET",
+            "/api/proxy/subscriptions",
+            &[("Origin", "https://untrusted.example")],
+            "",
+        );
+        assert_eq!(status, 403);
+        assert!(!headers.contains("Access-Control-Allow-Origin"));
+
+        let (status, headers, _) = http(
+            server.address,
+            "OPTIONS",
+            "/api/proxy/status",
+            &[
+                ("Origin", "http://localhost:3000"),
+                ("Access-Control-Request-Method", "DELETE"),
+                ("Access-Control-Request-Headers", "authorization"),
+            ],
+            "",
+        );
+        assert_eq!(status, 403);
+        assert!(!headers.contains("Access-Control-Allow-Credentials"));
+
+        let (status, headers, _) = http(
+            server.address,
+            "OPTIONS",
+            "/api/proxy/status",
+            &[
+                ("Origin", "http://localhost:3000"),
+                ("Access-Control-Request-Method", "GET"),
+                (
+                    "Access-Control-Request-Headers",
+                    "authorization, content-type",
+                ),
+            ],
+            "",
+        );
+        assert_eq!(status, 204);
+        assert!(headers.contains("Access-Control-Allow-Origin: http://localhost:3000"));
+        assert!(!headers.contains("Access-Control-Allow-Credentials"));
+    }
+
+    #[test]
+    fn proxy_only_lan_origin_must_match_the_webui_host_and_port() {
+        let bind = "192.168.0.1:9090".parse().unwrap();
+        assert!(super::proxy_only_origin_allowed(
+            "http://192.168.0.1:8080",
+            bind
+        ));
+        assert!(!super::proxy_only_origin_allowed(
+            "http://192.168.0.1:9090",
+            bind
+        ));
+        assert!(!super::proxy_only_origin_allowed(
+            "http://192.168.0.2:8080",
+            bind
+        ));
     }
 }

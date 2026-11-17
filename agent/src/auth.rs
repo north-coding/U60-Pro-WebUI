@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 use std::fs;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -39,6 +41,17 @@ struct LoginAttempt {
 impl AuthState {
     pub fn new() -> Self {
         let salt = load_or_create_salt();
+        Self::from_salt(salt)
+    }
+
+    /// Create the password-only proxy auth state with its salt in the managed
+    /// runtime tree. Unlike legacy `new()`, failures are fatal to startup.
+    pub fn new_with_salt_path(path: &Path) -> Result<Self, String> {
+        let salt = load_or_create_salt_at(path)?;
+        Ok(Self::from_salt(salt))
+    }
+
+    fn from_salt(salt: Vec<u8>) -> Self {
         Self {
             password_hash: Mutex::new(None),
             pin_hash: Mutex::new(None),
@@ -229,6 +242,82 @@ fn load_or_create_salt() -> Vec<u8> {
     salt
 }
 
+fn load_or_create_salt_at(path: &Path) -> Result<Vec<u8>, String> {
+    let parent = path
+        .parent()
+        .ok_or_else(|| "authentication salt path has no parent".to_string())?;
+    if path == Path::new(crate::mihomo::PROXY_AUTH_SALT) {
+        let data_dir = Path::new("/data");
+        let data_metadata = fs::symlink_metadata(data_dir)
+            .map_err(|error| format!("data partition is unavailable: {error}"))?;
+        if data_metadata.file_type().is_symlink() || !data_metadata.is_dir() {
+            return Err("data partition path is not a real directory".into());
+        }
+        let managed_root = Path::new(crate::mihomo::PROXY_AUTH_DIR)
+            .parent()
+            .ok_or_else(|| "managed authentication directory has no runtime root".to_string())?;
+        let metadata = fs::symlink_metadata(managed_root)
+            .map_err(|error| format!("managed runtime root is unavailable: {error}"))?;
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.uid() != unsafe { libc::geteuid() }
+        {
+            return Err("managed runtime root has unexpected type or owner".into());
+        }
+    }
+    match fs::symlink_metadata(parent) {
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                || !metadata.is_dir()
+                || metadata.uid() != unsafe { libc::geteuid() } =>
+        {
+            return Err("authentication directory has unexpected type or owner".into());
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("cannot inspect authentication directory: {error}")),
+    }
+    fs::create_dir_all(parent)
+        .map_err(|error| format!("cannot create authentication directory: {error}"))?;
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+        .map_err(|error| format!("cannot secure authentication directory: {error}"))?;
+
+    if let Ok(metadata) = fs::symlink_metadata(path) {
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return Err("authentication salt is not a regular file".into());
+        }
+        // Reject a salt owned by another uid instead of silently trusting it.
+        if metadata.uid() != unsafe { libc::geteuid() } {
+            return Err("authentication salt has an unexpected owner".into());
+        }
+        if metadata.nlink() != 1 {
+            return Err("authentication salt is unexpectedly shared".into());
+        }
+        if metadata.mode() & 0o7777 != 0o600 {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+                .map_err(|error| format!("cannot secure authentication salt: {error}"))?;
+        }
+        if let Ok(salt_hex) = fs::read_to_string(path) {
+            if let Ok(salt) = hex_decode(salt_hex.trim()) {
+                if salt.len() >= 16 {
+                    return Ok(salt);
+                }
+            }
+        }
+    }
+
+    let mut salt = vec![0u8; 32];
+    fs::File::open("/dev/urandom")
+        .and_then(|mut random| std::io::Read::read_exact(&mut random, &mut salt))
+        .map_err(|error| format!("secure random source is unavailable: {error}"))?;
+    if salt.iter().all(|byte| *byte == 0) {
+        return Err("secure random source is unavailable".into());
+    }
+    crate::storage::atomic_write(path, hex_encode(&salt).as_bytes())
+        .map_err(|error| format!("cannot persist authentication salt: {error}"))?;
+    Ok(salt)
+}
+
 fn read_urandom(buf: &mut [u8]) {
     use std::io::Read;
     if let Ok(mut f) = fs::File::open("/dev/urandom") {
@@ -369,5 +458,42 @@ mod tests {
 
         auth.tokens.safe_lock()[0].expires = epoch_secs() - 1;
         assert!(!auth.validate(&token));
+    }
+
+    #[test]
+    fn proxy_only_salt_is_persisted_under_a_private_synthetic_root() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "u60-auth-salt-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        let salt_path = root.join("auth/salt");
+        let auth = AuthState::new_with_salt_path(&salt_path).unwrap();
+        auth.set_password("synthetic-password");
+        assert!(matches!(
+            auth.login_password("synthetic-password", IP),
+            LoginResult::Ok { .. }
+        ));
+        assert_eq!(
+            std::fs::metadata(salt_path.parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        assert_eq!(
+            std::fs::metadata(&salt_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        let reloaded = AuthState::new_with_salt_path(&salt_path).unwrap();
+        reloaded.set_password("synthetic-password");
+        assert!(matches!(
+            reloaded.login_password("synthetic-password", IP),
+            LoginResult::Ok { .. }
+        ));
+        let _ = std::fs::remove_dir_all(root);
     }
 }

@@ -22,7 +22,7 @@ mod service;
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -36,6 +36,8 @@ use service::Process;
 
 const STATE_FILE: &str = paths::MIHOMO_STATE;
 const PROVIDERS_DIR: &str = paths::MIHOMO_PROVIDERS;
+pub const PROXY_AUTH_SALT: &str = paths::AUTH_SALT;
+pub const PROXY_AUTH_DIR: &str = paths::AUTH_DIR;
 const TICK: Duration = Duration::from_secs(5);
 const FIREWALL_CHECK_EVERY: Duration = Duration::from_secs(15);
 const CRASH_WINDOW: Duration = Duration::from_secs(600);
@@ -59,6 +61,8 @@ pub struct Manager {
 
 struct Inner {
     state: State,
+    state_file: PathBuf,
+    proxy_only: bool,
     process: Option<Process>,
     version: Option<String>,
     restarts: u32,
@@ -177,21 +181,46 @@ fn random_hex(bytes: usize) -> String {
     buf.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-fn load_state() -> State {
-    let mut state = fs::read(STATE_FILE)
+fn load_state(path: &Path) -> State {
+    let mut state = fs::read(path)
         .ok()
         .and_then(|b| serde_json::from_slice::<State>(&b).ok())
         .unwrap_or_default();
-    if state.secret.is_empty() {
-        state.secret = random_hex(16);
-    }
+    ensure_state_secret(&mut state);
     state
 }
 
-fn save_state(state: &State) -> Result<(), String> {
+/// Proxy-only startup must not silently replace an unreadable or malformed
+/// subscription store with defaults. A missing file is a fresh installation.
+fn load_proxy_only_state(path: &Path) -> Result<State, String> {
+    let mut state = match fs::read(path) {
+        Ok(bytes) => serde_json::from_slice::<State>(&bytes).map_err(|error| {
+            format!(
+                "cannot parse managed Mihomo state {}: {error}",
+                path.display()
+            )
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => State::default(),
+        Err(error) => {
+            return Err(format!(
+                "cannot read managed Mihomo state {}: {error}",
+                path.display()
+            ))
+        }
+    };
+    ensure_state_secret(&mut state);
+    Ok(state)
+}
+
+fn ensure_state_secret(state: &mut State) {
+    if state.secret.is_empty() {
+        state.secret = random_hex(16);
+    }
+}
+
+fn save_state(path: &Path, state: &State) -> Result<(), String> {
     let bytes = serde_json::to_vec_pretty(state).map_err(|e| e.to_string())?;
-    atomic_write(Path::new(STATE_FILE), &bytes)
-        .map_err(|e| format!("cannot save {STATE_FILE}: {e}"))
+    atomic_write(path, &bytes).map_err(|e| format!("cannot save {}: {e}", path.display()))
 }
 
 /// Unix seconds → `YYYY-MM-DDTHH:MM:SSZ` (civil-from-days, no date crate).
@@ -221,13 +250,37 @@ fn usage_json(u: &config::Usage) -> Value {
 
 impl Manager {
     pub fn new() -> Self {
-        let process = service::adopt();
+        Self::build(service::adopt(), PathBuf::from(STATE_FILE), false)
+    }
+
+    /// Proxy-only mode deliberately does not inspect, adopt, or remove a PID
+    /// record left by another Agent process.
+    pub fn new_proxy_only() -> Result<Self, String> {
+        service::validate_proxy_only_paths()?;
+        let state_file = PathBuf::from(STATE_FILE);
+        let state = load_proxy_only_state(&state_file)?;
+        Ok(Self::build_with_state(None, state_file, true, state))
+    }
+
+    fn build(process: Option<Process>, state_file: PathBuf, proxy_only: bool) -> Self {
+        let state = load_state(&state_file);
+        Self::build_with_state(process, state_file, proxy_only, state)
+    }
+
+    fn build_with_state(
+        process: Option<Process>,
+        state_file: PathBuf,
+        proxy_only: bool,
+        state: State,
+    ) -> Self {
         if let Some(p) = &process {
             eprintln!("[mihomo] adopted running mihomo (pid {})", p.pid);
         }
         Self {
             inner: Mutex::new(Inner {
-                state: load_state(),
+                state,
+                state_file,
+                proxy_only,
                 process,
                 version: None,
                 restarts: 0,
@@ -247,6 +300,11 @@ impl Manager {
                 health: Health::default(),
             }),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_proxy_only_for_test(state_file: PathBuf) -> Self {
+        Self::build(None, state_file, true)
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -380,8 +438,12 @@ impl Inner {
             },
             None => None,
         };
-        let Ok(rendered) = config::render(&self.state, &ip, base.as_ref(), service::ui_installed())
-        else {
+        let rendered = if self.proxy_only {
+            config::render_proxy_only(&self.state, &ip, base.as_ref())
+        } else {
+            config::render(&self.state, &ip, base.as_ref(), service::ui_installed())
+        };
+        let Ok(rendered) = rendered else {
             return;
         };
         let Ok(bytes) = serde_json::to_vec_pretty(&rendered) else {
@@ -574,7 +636,7 @@ impl Inner {
             if self.state.settings.tun && self.crashes.len() >= TUN_CRASH_LIMIT {
                 let mut next = self.state.clone();
                 next.settings.tun = false;
-                if self.write_config(&next).is_ok() && save_state(&next).is_ok() {
+                if self.write_config(&next).is_ok() && save_state(&self.state_file, &next).is_ok() {
                     self.state = next;
                     self.notice = Some(format!(
                         "TUN was turned off after mihomo stopped {TUN_CRASH_LIMIT} times within 10 minutes. \
@@ -669,13 +731,20 @@ impl Inner {
             Some(id) => Some(profile::load(id)?),
             None => None,
         };
-        let rendered = config::render(next, &ip, base.as_ref(), service::ui_installed())?;
+        let rendered = if self.proxy_only {
+            config::render_proxy_only(next, &ip, base.as_ref())?
+        } else {
+            config::render(next, &ip, base.as_ref(), service::ui_installed())?
+        };
         serde_json::to_vec_pretty(&rendered).map_err(|e| e.to_string())
     }
 
     /// Validate staged bytes with `mihomo -t`, then atomically install them.
     /// Returns the previous file contents for rollback.
     fn install_config(&self, bytes: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        if self.proxy_only {
+            service::ensure_proxy_only_runtime_dir()?;
+        }
         atomic_write(Path::new(service::STAGED), bytes)
             .map_err(|e| format!("cannot write config: {e}"))?;
         let tested = service::test_config(service::STAGED);
@@ -739,6 +808,7 @@ impl Inner {
         for _ in 0..15 {
             std::thread::sleep(Duration::from_millis(200));
             if !process.alive() {
+                process.clear_pidfile_if_child_exited();
                 self.remove_owned_firewall();
                 return Err(service::log_tail_error()
                     .unwrap_or_else(|| "mihomo exited during start".into()));
@@ -798,7 +868,7 @@ impl Inner {
         // firewall leases and the currently running process untouched.
         let install_and_save = || {
             let previous_file = self.install_config(&rendered)?;
-            if let Err(error) = save_state(&next) {
+            if let Err(error) = save_state(&self.state_file, &next) {
                 let _ = self.restore_config(previous_file.as_deref());
                 return Err(error);
             }
@@ -827,7 +897,7 @@ impl Inner {
         if let Err(e) = outcome {
             // Put the previous config and state back, and the process with them.
             let _ = self.restore_config(previous_file.as_deref());
-            let _ = save_state(&previous_state);
+            let _ = save_state(&self.state_file, &previous_state);
             self.state = previous_state;
             if self.alive() {
                 let _ = self.reload();
@@ -862,6 +932,12 @@ impl Inner {
         let running = self.alive();
         let s = self.state.settings.clone();
         let ip = lan_ip().ok();
+        let panel_installed = !self.proxy_only && service::ui_installed();
+        let notice = self.notice.clone().or_else(|| {
+            (self.proxy_only && !running && service::managed_pid_record_present()).then(|| {
+                "an unverified managed PID record blocks process adoption and start".into()
+            })
+        });
         let mut traffic = Value::Null;
         let mut route = Value::Null;
         if running {
@@ -908,9 +984,9 @@ impl Inner {
             "profile": profile,
             "tun": s.tun,
             "panel": {
-                "installed": service::ui_installed(),
-                "url": ip.as_ref().map(|ip| format!("http://{ip}:{}/ui/", config::CONTROLLER_PORT)),
-                "secret": Some(self.live_panel_secret()).filter(|s| !s.is_empty()),
+                "installed": panel_installed,
+                "url": panel_installed.then(|| ip.as_ref().map(|ip| format!("http://{ip}:{}/ui/", config::CONTROLLER_PORT))).flatten(),
+                "secret": panel_installed.then(|| self.live_panel_secret()).filter(|s| !s.is_empty()),
             },
             "tun_active": service::tun_active(),
             "cn_bypass": s.cn_bypass,
@@ -919,7 +995,9 @@ impl Inner {
             "mixed_port": s.mixed_port,
             "lan_ip": ip,
             "proxy_address": ip.as_ref().map(|ip| format!("{ip}:{}", s.mixed_port)),
-            "pac_url": ip.as_ref().map(|ip| format!("http://{ip}:9090/proxy.pac")),
+            "pac_url": (!self.proxy_only)
+                .then(|| ip.as_ref().map(|ip| format!("http://{ip}:9090/proxy.pac")))
+                .flatten(),
             "subscriptions": self.state.subscriptions.len(),
             "traffic": traffic,
             "route": route,
@@ -931,7 +1009,7 @@ impl Inner {
             },
             "restarts": self.restarts,
             "last_error": self.last_error,
-            "notice": self.notice,
+            "notice": notice,
         })
     }
 }
@@ -1725,6 +1803,8 @@ mod tests {
             Manager {
                 inner: Mutex::new(Inner {
                     state: State::default(),
+                    state_file: PathBuf::from(STATE_FILE),
+                    proxy_only: false,
                     process: None,
                     version: None,
                     restarts: 0,
@@ -1756,6 +1836,78 @@ mod tests {
             "JP 01": {"type": "Trojan", "history": []},
             "DIRECT": {"type": "Direct"},
         })
+    }
+
+    fn scratch_state_file(label: &str) -> PathBuf {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "u60-proxy-{label}-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("mihomo/manager.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn proxy_only_manager_loads_synthetic_subscription_state_without_adoption() {
+        let path = scratch_state_file("proxy-only-state");
+        let mut saved = State {
+            secret: "synthetic-controller-secret".into(),
+            ..State::default()
+        };
+        saved.subscriptions.push(Subscription {
+            id: "a1b2c3d4".into(),
+            name: "synthetic-provider".into(),
+            url: "https://provider.invalid/token".into(),
+            enabled: true,
+            interval_hours: 0,
+            fetched: None,
+        });
+        save_state(&path, &saved).unwrap();
+
+        let manager = Manager::new_proxy_only_for_test(path.clone());
+        assert!(manager.lock().process.is_none());
+        let (status, body) = manager.subscriptions();
+        assert_eq!(status, 200);
+        assert_eq!(body["data"]["subscriptions"][0]["id"], "a1b2c3d4");
+        assert_eq!(
+            body["data"]["subscriptions"][0]["name"],
+            "synthetic-provider"
+        );
+        assert_eq!(load_state(&path).subscriptions[0].id, "a1b2c3d4");
+
+        let root = path.parent().unwrap().parent().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn manager_state_persistence_is_scoped_to_the_supplied_root() {
+        let path = scratch_state_file("state-persistence");
+        let saved = State {
+            secret: "synthetic-secret".into(),
+            ..State::default()
+        };
+        save_state(&path, &saved).unwrap();
+        assert_eq!(load_state(&path).secret, "synthetic-secret");
+        assert!(path.exists());
+        let root = path.parent().unwrap().parent().unwrap();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn proxy_only_state_rejects_corruption_and_accepts_a_fresh_store() {
+        let path = scratch_state_file("invalid-state");
+        assert!(!path.exists());
+        assert!(load_proxy_only_state(&path).is_ok());
+
+        std::fs::write(&path, b"{not valid json").unwrap();
+        assert!(load_proxy_only_state(&path).is_err());
+
+        let root = path.parent().unwrap().parent().unwrap();
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
