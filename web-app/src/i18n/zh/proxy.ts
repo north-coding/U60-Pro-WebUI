@@ -59,14 +59,24 @@ export const proxy: Record<string, string> = {
   'Android: Wi-Fi → network → Edit → Proxy → Proxy Auto-Config': 'Android：WLAN → 当前网络 → 修改 → 代理 → 自动配置代理',
 
   // Subscriptions
-  '{n} subscription(s) failed to update': '{n} 个订阅更新失败',
+  '{updated} of {total} subscriptions updated; {failed} failed': '{updated}/{total} 个订阅已更新；{failed} 个失败',
+  '{n} enabled subscriptions': '{n} 个已启用的订阅',
   'Subscriptions updated': '订阅已更新',
   'Failed to update subscriptions': '更新订阅失败',
+  'Start Mihomo and update?': '启动 Mihomo 并更新？',
+  'This starts Mihomo now and leaves it running after the update. It also enables Mihomo to start with the router.': '现在启动 Mihomo，更新后继续保持运行，并启用路由器启动时自动运行。',
+  'If transparent proxy is enabled, LAN traffic may route through Mihomo.': '如果已启用透明代理，局域网流量可能会经由 Mihomo 转发。',
+  'Stop Mihomo in Overview or turn off transparent proxy in Settings.': '可在“概览”中停止 Mihomo，或在“设置”中关闭透明代理。',
+  'Start & update': '启动并更新',
+  'Start & update all': '启动并全部更新',
+  'Mihomo did not become ready. Subscriptions were not updated.': 'Mihomo 未能就绪，订阅未更新。',
+  'Could not confirm Mihomo readiness. Subscriptions were not updated.': '无法确认 Mihomo 已就绪，订阅未更新。',
+  '{name}: {error}': '{name}：{error}',
+  'The proxy is stopped. Start Mihomo with an explicit update action to fetch enabled subscriptions.': '代理已停止。使用明确的“启动并更新”操作即可拉取已启用的订阅。',
   'Subscriptions could not be read: {error}': '无法读取订阅：{error}',
   'Subscriptions could not be read.': '无法读取订阅。',
   'No subscriptions yet': '还没有订阅',
   'Add your provider’s subscription link below to get nodes.': '在下方添加服务商提供的订阅链接以获取节点。',
-  'The proxy is stopped. Node counts, usage and updates appear once it runs.': '代理已停止。运行后才会显示节点数、用量并可更新订阅。',
   'Update all': '全部更新',
   'update failed': '更新失败',
   '{name} updated': '{name} 已更新',
@@ -103,6 +113,10 @@ export const proxy: Record<string, string> = {
   'Subscription link': '订阅链接',
   'Clash/mihomo or base64 (v2ray) format. Stored on the router readable by root only, and shown masked.':
     '支持 Clash/mihomo 或 base64（v2ray）格式。链接保存在路由器上，仅 root 可读，界面中打码显示。',
+  'Advanced: use the provider’s complete configuration': '高级选项：使用服务商的完整配置',
+  'Recommended: import only the provider’s nodes. Managed Rule mode uses the bypass_cn preset: mainland China traffic is DIRECT, foreign traffic is PROXY.':
+    '推荐：仅导入服务商节点。托管规则模式使用 bypass_cn 预设：中国大陆流量直连，境外流量走代理。',
+  'Import the complete provider configuration': '导入服务商完整配置',
 
   // Nodes
   'Failed to switch node': '切换节点失败',
@@ -218,9 +232,6 @@ export const proxy: Record<string, string> = {
   'Use managed rules': '改用托管规则',
   'Use its rules': '使用其规则',
   '{name} added as a node source: it has no groups or rules': '{name} 已添加为节点来源：它不包含分组和规则',
-  'Use the subscription’s own rules and groups': '使用订阅自带的规则与分组',
-  'Recommended for providers that serve a complete Clash/mihomo config. Turn off to use only its nodes with the managed rules.':
-    '适用于提供完整 Clash/mihomo 配置的服务商（推荐）。关闭后只使用其中的节点，规则由面板托管。',
   'Forwarding OK': '转发正常',
   'Not forwarding': '转发异常',
   'Starts at boot': '开机自启',

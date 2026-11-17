@@ -1830,6 +1830,8 @@ def proxy_defaults():
         "cn_bypass": True,
         "mixed_port": 7890,
         "profile": "a1b2c3d4",
+        # Synthetic failure injection for subscription refresh regression tests.
+        "update_errors": {},
         "now": {"PROXY": "AUTO", "节点选择": "自动选择", "国外媒体": "节点选择", "苹果服务": "直接连接",
                 "国内直连": "直接连接", "漏网之鱼": "节点选择", "直接连接": "DIRECT"},
         "started": now - 3 * 3600 - 420,
@@ -2029,6 +2031,10 @@ def post_proxy_subscription_update(body):
     targets = [_find_sub(obj["id"])] if "id" in obj else [s for s in p["subs"] if s["enabled"]]
     results = {}
     for sub in targets:
+        failure = p.get("update_errors", {}).get(sub["id"])
+        if failure:
+            results[sub["id"]] = {"ok": False, "error": failure}
+            continue
         if sub["id"] in PROXY_NODES and (p["running"] or p["profile"] == sub["id"]):
             sub["updated"] = int(time.time())
             sub.pop("error", None)

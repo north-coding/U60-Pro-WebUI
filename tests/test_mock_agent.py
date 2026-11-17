@@ -235,6 +235,41 @@ class ProxySubscriptionFlow(MockCase):
         self.assertFalse(airport['use_config'])
         self.assertNotIn('secret-token', json.dumps(subscriptions))
 
+    def test_start_then_manually_update_a_provider(self):
+        proxy = mock.STATE['proxy']
+        proxy.update(running=False, profile=None)
+        proxy['subs'][0]['updated'] = None
+        started = self.data('POST', '/api/proxy/service', {'action': 'start'})
+        self.assertTrue(started['running'])
+        self.assertTrue(started['enabled'])
+        result = self.data('POST', '/api/proxy/subscriptions/update', {'id': 'a1b2c3d4'})
+        self.assertEqual(result['results'], {'a1b2c3d4': {'ok': True}})
+        self.assertIsNotNone(mock.STATE['proxy']['subs'][0]['updated'])
+
+    def test_update_all_reports_partial_provider_failure(self):
+        proxy = mock.STATE['proxy']
+        proxy.update(running=True, profile=None)
+        proxy['update_errors'] = {'e5f6a7b8': 'synthetic provider failure'}
+        result = self.data('POST', '/api/proxy/subscriptions/update', {})
+        self.assertEqual(result['results']['a1b2c3d4'], {'ok': True})
+        self.assertEqual(result['results']['e5f6a7b8'], {'ok': False, 'error': 'synthetic provider failure'})
+
+    def test_failed_refresh_preserves_cached_nodes_and_last_success(self):
+        proxy = mock.STATE['proxy']
+        proxy.update(running=True, profile=None)
+        backup = next(sub for sub in proxy['subs'] if sub['id'] == 'e5f6a7b8')
+        last_success = backup['updated']
+        cached_nodes = [node['name'] for node in self.data('GET', '/api/proxy/groups')['nodes']]
+        proxy['update_errors'] = {'e5f6a7b8': 'synthetic provider failure'}
+
+        result = self.data('POST', '/api/proxy/subscriptions/update', {'id': 'e5f6a7b8'})
+        self.assertEqual(result['results']['e5f6a7b8'], {'ok': False, 'error': 'synthetic provider failure'})
+        subscriptions = self.data('GET', '/api/proxy/subscriptions')['subscriptions']
+        failed = next(sub for sub in subscriptions if sub['id'] == 'e5f6a7b8')
+        current_nodes = [node['name'] for node in self.data('GET', '/api/proxy/groups')['nodes']]
+        self.assertEqual(failed['updated_at'], time.strftime('%Y-%m-%dT%H:%M:%SZ', time.gmtime(last_success)))
+        self.assertEqual(current_nodes, cached_nodes)
+
 
 class RadioReadBack(MockCase):
     def test_nr_band_lock_reads_back_in_the_sa_field_only(self):

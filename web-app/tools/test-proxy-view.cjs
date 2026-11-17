@@ -61,6 +61,7 @@ test('service state distinguishes missing core, failing and stopped', () => {
 test('new subscriptions default to manual-only updates', () => {
   assert.equal(view.DEFAULT_SUBSCRIPTION_INTERVAL_HOURS, 0)
   assert.equal(view.intervalLabel(view.DEFAULT_SUBSCRIPTION_INTERVAL_HOURS), 'Manual only')
+  assert.equal(view.DEFAULT_SUBSCRIPTION_USE_CONFIG, false)
 })
 
 test('subscriptions mapper drops malformed rows and empty usage', () => {
