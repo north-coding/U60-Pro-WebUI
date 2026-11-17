@@ -13,6 +13,7 @@ mod device_ext;
 mod diag_log;
 mod event_bus;
 mod handlers;
+mod isolated_readonly;
 mod lan;
 mod logging;
 mod mihomo;
@@ -46,6 +47,23 @@ const DEFAULT_THREADS: usize = 4;
 const STARTUP_SCRIPT: &str = "/data/local/tmp/start_zte_agent.sh";
 
 fn main() {
+    // Select the isolated-only path before diagnostics, cleanup, AppState,
+    // watchdogs, shell scripts, USB mode enforcement, or LAN recovery.
+    match isolated_readonly::select_mode(std::env::args_os().skip(1)) {
+        Ok(isolated_readonly::StartupMode::IsolatedReadonly) => {
+            if let Err(err) = isolated_readonly::run() {
+                eprintln!("[isolated-readonly-prototype] {err}");
+                std::process::exit(1);
+            }
+            return;
+        }
+        Ok(isolated_readonly::StartupMode::Legacy) => {}
+        Err(usage) => {
+            eprintln!("{usage}");
+            std::process::exit(2);
+        }
+    }
+
     diag_log::init();
     eprintln!(
         "[agent] zte-agent {} starting (pid {})",
