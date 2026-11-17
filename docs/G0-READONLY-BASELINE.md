@@ -42,9 +42,9 @@ Compared with this ancestor, Peter has 25 branch-only commits / 146 changed path
 
 Historical owner facts are not assumed to reflect today's process/port state. We have NOT inspected the live router.
 
-## 4. CI and offline validation
+## 4. Local validation
 
-Existing `.github/workflows/checks.yml` already covers Rust format/test/clippy, Python tests and API contract, web build/lint/tests, browser checks and native installer matrix. Avoid redundant CI. GitHub Actions is enabled in our fork, but has no fork-specific runs yet; a Draft PR can trigger it.
+The Owner's existing decision excludes GitHub Actions/CI. All tests, builds, and reviews use the authorized local development and reviewer environments; GitHub is for version control and Draft PRs only.
 
 Mac Dev was missing Rust/Cargo (and no Rust toolchain was installed in G0). Therefore no local Rust build/test or ARM64 execution is claimed. Local Python validation:
 
@@ -52,7 +52,7 @@ Mac Dev was missing Rust/Cargo (and no Rust toolchain was installed in G0). Ther
 - `python3 scripts/check-api-contract.py`: **PASS**; agent/dashboard/mock all report 111 routes across 90 paths.
 - `python3 scripts/check-device-secrets.py`: **PASS** for its tracked-secret scan scope.
 - `git diff --check`: **PASS**.
-- Node/npm dashboard and Playwright checks **not locally executed** in G0; pending Fork CI.
+- Node/npm dashboard and Playwright checks **not locally executed** in G0; remain pending authorized local-only validation.
 
 Passing a source/mocked test does not establish any specific hardware or firewall behavior.
 
@@ -67,7 +67,7 @@ Passing a source/mocked test does not establish any specific hardware or firewal
 
 ## 6. Decision
 
-**GO** to private fork, test-only patch, Draft PR and Fork CI checks.
+**GO** to private fork, test-only patch, Draft PR, and local-only tests/review. No GitHub Actions/CI.
 **NO-GO** to device install, upstream v2.5 merge, SSH service reprovision, transparent proxy activation or removal of old Mihomo.
 
 Potential future tasks after G0: review/port narrowly justified upstream security changes, design isolated configurable Agent port and independent Mihomo data directory, and implement/test a guarded SSH preflight. All real router actions remain subject to an explicit owner-approved execution window.
