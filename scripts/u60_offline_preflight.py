@@ -213,6 +213,7 @@ def main(argv: list[str] | None = None) -> int:
     args = sys.argv[1:] if argv is None else argv
     if len(args) != 1:
         print("Usage: u60_offline_preflight.py SNAPSHOT.json", file=sys.stderr)
+        print(AUTHORIZATION_NOTICE)
         return 2
 
     try:

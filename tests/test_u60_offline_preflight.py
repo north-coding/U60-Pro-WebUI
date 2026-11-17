@@ -33,6 +33,18 @@ def clean_snapshot(now=NOW):
 
 
 class OfflinePreflightTests(unittest.TestCase):
+    def test_invalid_argument_counts_print_authorization_notice(self):
+        for args in ([], ["one.json", "two.json"]):
+            with self.subTest(args=args):
+                stdout = io.StringIO()
+                stderr = io.StringIO()
+                with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    result = preflight.main(args)
+
+                self.assertEqual(result, 2)
+                self.assertIn("Usage: u60_offline_preflight.py SNAPSHOT.json", stderr.getvalue())
+                self.assertIn(preflight.AUTHORIZATION_NOTICE, stdout.getvalue())
+
     def test_port_collisions_are_reported_without_owner_values(self):
         snapshot = clean_snapshot()
         snapshot["ports"] = [
