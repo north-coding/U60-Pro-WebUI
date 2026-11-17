@@ -42,6 +42,18 @@ Owner: north-coding. Development host: Mac Dev only. This ledger tracks **tempor
 | `/Users/north/Developer/Worktrees/u60-pro-webui-g1b-20261117/web-app/dist` | G1-C | Regenerable local TypeScript/Vite build output | PENDING_CLEANUP | After G1-C UI build evidence archived |
 | `/tmp/u60-g1c-frontend-local-20261117.log` | G1-C | npm ci/build/lint/275 Node tests evidence for G1-B head 9deff002 | PENDING_CLEANUP | After G1-C local validation report finalized |
 
-Next review: after G1-B offline focused audit; before any G1-B device-facing SSH installer work. Only the Owner-approved lifecycle may authorize deleting authoritative evidence or worktrees with unresolved recovery value. **No cleanup performed in G0/G1-A.**
+| `/Users/north/Developer/Worktrees/u60-pro-webui-g1c-20261117` | G1-C | Isolated loopback-only read-only startup prototype; stacked on Draft PR #3 | RETAIN / DRAFT_CANDIDATE | G1-C local and independent review complete |
+| `/tmp/u60-g1c-isolated-readonly-contract-20261117.md` | G1-C | Bounded Codex implementation task contract | PENDING_CLEANUP | G1-C PR lifecycle decision |
+| `/tmp/u60-g1c-isolated-readonly-codex-20261117.log` | G1-C | Interrupted Codex read-heavy execution, no code edits; retained as actual invocation evidence | PENDING_CLEANUP | G1-C PR lifecycle decision |
+| `/tmp/u60-g1c-rust-native-20261117.log` | G1-C | Native 124 pass, 4 ignored Rust tests for isolated prototype | PENDING_CLEANUP | G1-C review completion |
+| `/tmp/u60-g1c-verify-20261117.log` | G1-C | Native 124-pass Rust, ARM64 musl check, clippy-scoped, Mac binary link and 98 Python regression evidence | PENDING_CLEANUP | G1-C review completion |
+| `/tmp/u60-g1c-loopback-smoke-20261117.py` | G1-C | Mac Dev-only isolated binary HTTP/CLI/port-conflict smoke harness, never legacy startup | PENDING_CLEANUP | After G1-C exact candidate review |
+| `/tmp/u60-g1c-loopback-smoke-20261117.log` | G1-C | Successful real Mac Dev loopback process verification and termination evidence | PENDING_CLEANUP | After G1-C exact candidate review |
+| `/tmp/u60-g1c-focused-review-20261117.md` | G1-C | Focused ChatGPT exact-diff security review with remaining independent-review gate | PENDING_CLEANUP | After G1-C PR lifecycle decision |
+| `/tmp/u60-g1c-review-prompt-20261117.md` | G1-C | Separate read-only Codex reviewer instruction, no modification scope | PENDING_CLEANUP | After G1-C PR lifecycle decision |
+| `/tmp/u60-g1c-review-codex-20261117.log` | G1-C | Separate read-only reviewer transcript, if executed; no external paid reviewer permitted | PENDING_CLEANUP | After G1-C PR lifecycle decision |
+| `/tmp/u60-g1c-pr-body-20261117.md` | G1-C | Draft PR #4 scope, test evidence and security gates | PENDING_CLEANUP | After G1-C PR lifecycle decision |
+
+Next review: after G1-C exact-diff offline security review; before any on-device tests or device-facing SSH installer work. Only the Owner-approved lifecycle may authorize deleting authoritative evidence or worktrees with unresolved recovery value. **No cleanup performed in G0/G1-A.**
 
 No GitHub Actions/CI is authorized; local tests and proportionate independent review are the evidence source.
