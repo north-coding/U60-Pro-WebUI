@@ -54,6 +54,15 @@ Owner: north-coding. Development host: Mac Dev only. This ledger tracks **tempor
 | `/tmp/u60-g1c-review-codex-20261117.log` | G1-C | Separate read-only reviewer transcript, if executed; no external paid reviewer permitted | PENDING_CLEANUP | After G1-C PR lifecycle decision |
 | `/tmp/u60-g1c-pr-body-20261117.md` | G1-C | Draft PR #4 scope, test evidence and security gates | PENDING_CLEANUP | After G1-C PR lifecycle decision |
 
-Next review: after G1-C exact-diff offline security review; before any on-device tests or device-facing SSH installer work. Only the Owner-approved lifecycle may authorize deleting authoritative evidence or worktrees with unresolved recovery value. **No cleanup performed in G0/G1-A.**
+| `/Users/north/Developer/Worktrees/u60-pro-webui-g1d-20261117` | G1-D | Pure isolated Mihomo managed-config preview, stacked on G1-C Draft | RETAIN / DRAFT_CANDIDATE | G1-D review and PR lifecycle decision |
+| `/tmp/u60-g1d-codex-task-20261117.md` | G1-D | Scoped implementation contract for ChatGPT-subscription Codex | PENDING_CLEANUP | G1-D PR lifecycle decision |
+| `/tmp/u60-g1d-codex-20261117.log` | G1-D | Codex partial implementation transcript; 115s bound expired and orchestrator completed tests/hardening | PENDING_CLEANUP | G1-D PR lifecycle decision |
+| `/tmp/u60-g1d-rust-20261117.log` | G1-D | Native 129 passing Rust tests, 4 ignored | PENDING_CLEANUP | G1-D review completion |
+| `/tmp/u60-g1d-arm64-20261117.log` | G1-D | aarch64-unknown-linux-musl Rust type check only | PENDING_CLEANUP | G1-D review completion |
+| `/tmp/u60-g1d-clippy-20261117.log` | G1-D | Clippy scoped exception for two preexisting style lints | PENDING_CLEANUP | G1-D review completion |
+| `/tmp/u60-g1d-python-20261117.log` | G1-D | Offline Python regression test evidence | PENDING_CLEANUP | G1-D review completion |
+| `/tmp/u60-g1d-pr-body-20261117.md` | G1-D | Draft PR summary, boundaries and test evidence | PENDING_CLEANUP | G1-D PR lifecycle decision |
+
+Next review: after G1-D exact-diff offline source review; before any on-device test, live Mihomo process, or device-facing SSH installer work. Only the Owner-approved lifecycle may authorize deleting authoritative evidence or worktrees with unresolved recovery value. **No cleanup performed in G0/G1-A.**
 
 No GitHub Actions/CI is authorized; local tests and proportionate independent review are the evidence source.
