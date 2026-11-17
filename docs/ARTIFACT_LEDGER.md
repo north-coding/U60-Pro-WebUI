@@ -20,6 +20,8 @@ Owner: north-coding. Development host: Mac Dev only. This ledger tracks **tempor
 | `/tmp/u60-g1a-remediation-20261117.md` | G1-A | Focused reviewer-driven remediation instructions | PENDING_CLEANUP | After G1-A PR completion |
 | `/tmp/u60-g1a-remediation-codex-20261117.log` | G1-A | Remediation implementation evidence | PENDING_CLEANUP | After G1-A PR completion |
 | `/tmp/u60-g1a-all-py-tests-20261117.log` | G1-A | Host-side 80/80 Python test evidence | PENDING_CLEANUP | After G1-A PR completion |
+| `/tmp/u60-g1a-after-rebase-tests-20261117.log` | G1-A | Final host-side Python 80/80 tests after branch rebase | PENDING_CLEANUP | After G1-A PR completion |
+| `/tmp/u60-g1a-pr-body-20261117.md` | G1-A | Draft PR #2 description and scope | PENDING_CLEANUP | After PR #2 completion |
 
 Next review: after G1-A Draft PR review, before any G1-B device-facing SSH installer work. Only the Owner-approved lifecycle may authorize deleting authoritative evidence or worktrees with unresolved recovery value. **No cleanup performed in G0/G1-A.**
 
