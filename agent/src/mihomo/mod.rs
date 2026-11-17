@@ -6,7 +6,8 @@
 //! - profile: one subscription's own full config (groups, rules, rule sets)
 //!   with the router-specific keys replaced (`config::sanitize_profile`).
 //!
-//! State lives in /data/mihomo/manager.json (0600: it holds subscription URLs). Every change follows render → `mihomo -t` →
+//! State lives under /data/u60-pro-managed/mihomo (0600 where it holds subscription URLs),
+//! separate from the abandoned legacy /data/mihomo tree. Every change follows render → `mihomo -t` →
 //! atomic replace → hot reload, and is rolled back when the reload fails.
 
 // A guard in an `if let`/`match` scrutinee lives for the whole block (edition
@@ -15,6 +16,7 @@
 
 mod config;
 mod controller;
+mod paths;
 mod profile;
 mod service;
 
@@ -32,8 +34,8 @@ use config::{Mode, Preset, State, Subscription};
 use controller::{segment, Controller};
 use service::Process;
 
-const STATE_FILE: &str = "/data/mihomo/manager.json";
-const PROVIDERS_DIR: &str = "/data/mihomo/providers";
+const STATE_FILE: &str = paths::MIHOMO_STATE;
+const PROVIDERS_DIR: &str = paths::MIHOMO_PROVIDERS;
 const TICK: Duration = Duration::from_secs(5);
 const FIREWALL_CHECK_EVERY: Duration = Duration::from_secs(15);
 const CRASH_WINDOW: Duration = Duration::from_secs(600);
@@ -144,6 +146,18 @@ fn controller_fields(bytes: &[u8]) -> Vec<String> {
     .iter()
     .map(|k| v[*k].as_str().unwrap_or_default().to_string())
     .collect()
+}
+
+fn preflight_then<T>(
+    preflight: impl FnOnce() -> Result<(), String>,
+    transition: impl FnOnce() -> Result<T, String>,
+) -> Result<T, String> {
+    preflight()?;
+    transition()
+}
+
+fn transition_starts_process(enabled: bool, running: bool, needs_restart: bool) -> bool {
+    enabled && (!running || needs_restart)
 }
 
 /// The controller secret in a rendered config file ("" when none).
@@ -389,13 +403,21 @@ impl Inner {
         // An older agent ran mihomo without the controller socket: restart it
         // once instead of hot-reloading (which needs the socket).
         let socket = Path::new(config::CONTROLLER_SOCKET).exists();
-        match self.write_config(&state).and_then(|_| {
-            if socket {
-                self.reload()
-            } else {
-                self.restart()
-            }
-        }) {
+        let mut reconcile = || {
+            self.write_config(&state).and_then(|_| {
+                if socket {
+                    self.reload()
+                } else {
+                    self.restart()
+                }
+            })
+        };
+        let result = if socket {
+            reconcile()
+        } else {
+            preflight_then(|| service::preflight_routing(state.settings.tun), reconcile)
+        };
+        match result {
             Ok(()) => eprintln!("[mihomo] config updated to this agent version and reloaded"),
             Err(e) => {
                 eprintln!("[mihomo] could not apply the updated config: {e}");
@@ -639,17 +661,22 @@ impl Inner {
         }
     }
 
-    /// Render `next`, validate it with `mihomo -t`, then atomically make it the
-    /// live config file. Returns the previous file contents for rollback.
-    fn write_config(&self, next: &State) -> Result<Option<Vec<u8>>, String> {
+    /// Render `next` in memory. This is read-only so start transitions can
+    /// inspect whether a process start is needed before touching runtime files.
+    fn render_config(&self, next: &State) -> Result<Vec<u8>, String> {
         let ip = lan_ip()?;
         let base = match &next.settings.profile {
             Some(id) => Some(profile::load(id)?),
             None => None,
         };
         let rendered = config::render(next, &ip, base.as_ref(), service::ui_installed())?;
-        let bytes = serde_json::to_vec_pretty(&rendered).map_err(|e| e.to_string())?;
-        atomic_write(Path::new(service::STAGED), &bytes)
+        serde_json::to_vec_pretty(&rendered).map_err(|e| e.to_string())
+    }
+
+    /// Validate staged bytes with `mihomo -t`, then atomically install them.
+    /// Returns the previous file contents for rollback.
+    fn install_config(&self, bytes: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        atomic_write(Path::new(service::STAGED), bytes)
             .map_err(|e| format!("cannot write config: {e}"))?;
         let tested = service::test_config(service::STAGED);
         let previous = fs::read(service::CONFIG).ok();
@@ -659,6 +686,23 @@ impl Inner {
         });
         let _ = fs::remove_file(service::STAGED);
         result.map(|_| previous)
+    }
+
+    fn write_config(&self, next: &State) -> Result<Option<Vec<u8>>, String> {
+        let bytes = self.render_config(next)?;
+        self.install_config(&bytes)
+    }
+
+    fn restore_config(&self, previous: Option<&[u8]>) -> Result<(), String> {
+        match previous {
+            Some(bytes) => atomic_write(Path::new(service::CONFIG), bytes)
+                .map_err(|e| format!("cannot restore config: {e}")),
+            None => match fs::remove_file(service::CONFIG) {
+                Ok(()) => Ok(()),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                Err(error) => Err(format!("cannot remove uncommitted config: {error}")),
+            },
+        }
     }
 
     fn start(&mut self) -> Result<(), String> {
@@ -672,10 +716,14 @@ impl Inner {
         if !service::address_ready(&ip) {
             return Err(format!("LAN address {ip} is not up yet"));
         }
+        // Check before touching either the live or staged config. The check is
+        // read-only and must precede every process-start side effect.
         // The LAN address may have changed since the file was written.
         let state = self.state.clone();
-        self.write_config(&state)?;
-        service::preflight_routing(self.state.settings.tun)?;
+        preflight_then(
+            || service::preflight_routing(state.settings.tun),
+            || self.write_config(&state),
+        )?;
         if self.state.settings.tun {
             let lease = service::firewall_add()?;
             self.firewall_lease.extend(lease);
@@ -721,6 +769,10 @@ impl Inner {
     }
 
     fn restart(&mut self) -> Result<(), String> {
+        // The current routing state cannot be attributed to Mihomo from its
+        // priority/table alone. Refuse to stop or restart while any such state
+        // is present; callers can stop explicitly and inspect before starting.
+        service::preflight_routing(self.state.settings.tun)?;
         self.stop();
         self.start()
     }
@@ -728,20 +780,39 @@ impl Inner {
     /// Make `next` the desired state and bring the running process in line.
     fn apply(&mut self, next: State) -> Result<(), String> {
         let previous_state = self.state.clone();
-        let previous_file = self.write_config(&next)?;
-        save_state(&next)?;
-        self.state = next;
-
         let running = self.alive();
+        let old_file = fs::read(service::CONFIG).ok();
+        let rendered = self.render_config(&next)?;
         // mihomo's reload API applies nodes, groups, rules, DNS and the rest,
         // but not the controller settings (address, socket, panel, secret);
         // a subscription update can change the secret, so those restart.
-        let new_file = fs::read(service::CONFIG).ok();
-        let controller_changed = previous_file.as_deref().map(controller_fields)
-            != new_file.as_deref().map(controller_fields);
-        let needs_restart = previous_state.settings.tun != self.state.settings.tun
-            || previous_state.settings.mixed_port != self.state.settings.mixed_port
+        let controller_changed =
+            old_file.as_deref().map(controller_fields) != Some(controller_fields(&rendered));
+        let needs_restart = previous_state.settings.tun != next.settings.tun
+            || previous_state.settings.mixed_port != next.settings.mixed_port
             || controller_changed;
+        let will_start = transition_starts_process(next.settings.enabled, running, needs_restart);
+
+        // The gate encloses every persistent config/state write. If routing
+        // ownership cannot be established, apply returns with those files,
+        // firewall leases and the currently running process untouched.
+        let install_and_save = || {
+            let previous_file = self.install_config(&rendered)?;
+            if let Err(error) = save_state(&next) {
+                let _ = self.restore_config(previous_file.as_deref());
+                return Err(error);
+            }
+            Ok(previous_file)
+        };
+        let previous_file = if will_start {
+            preflight_then(
+                || service::preflight_routing(next.settings.tun),
+                install_and_save,
+            )?
+        } else {
+            install_and_save()?
+        };
+        self.state = next;
 
         let outcome = match (self.state.settings.enabled, running) {
             (true, true) if needs_restart => self.restart(),
@@ -755,9 +826,7 @@ impl Inner {
         };
         if let Err(e) = outcome {
             // Put the previous config and state back, and the process with them.
-            if let Some(bytes) = previous_file {
-                let _ = atomic_write(Path::new(service::CONFIG), &bytes);
-            }
+            let _ = self.restore_config(previous_file.as_deref());
             let _ = save_state(&previous_state);
             self.state = previous_state;
             if self.alive() {
@@ -1690,6 +1759,47 @@ mod tests {
     }
 
     #[test]
+    fn start_preflight_failure_leaves_runtime_files_and_network_effects_untouched() {
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct Runtime {
+            config: Vec<u8>,
+            state: Vec<u8>,
+            routes: Vec<String>,
+            firewall: Vec<String>,
+        }
+
+        let mut runtime = Runtime {
+            config: b"previous-config".to_vec(),
+            state: b"previous-state".to_vec(),
+            routes: vec!["existing-route".into()],
+            firewall: vec!["existing-firewall-rule".into()],
+        };
+        let before = runtime.clone();
+        let result: Result<(), String> = preflight_then(
+            || Err("synthetic routing conflict".into()),
+            || {
+                runtime.config = b"new-config".to_vec();
+                runtime.state = b"new-state".to_vec();
+                runtime.routes.push("new-route".into());
+                runtime.firewall.push("new-firewall-rule".into());
+                Ok(())
+            },
+        );
+
+        assert_eq!(result.unwrap_err(), "synthetic routing conflict");
+        assert_eq!(runtime, before);
+    }
+
+    #[test]
+    fn preflight_is_required_only_for_transitions_that_start_a_process() {
+        assert!(transition_starts_process(true, false, false));
+        assert!(transition_starts_process(true, true, true));
+        assert!(!transition_starts_process(true, true, false));
+        assert!(!transition_starts_process(false, true, true));
+        assert!(!transition_starts_process(false, false, false));
+    }
+
+    #[test]
     fn route_follows_groups_to_the_node() {
         assert_eq!(
             main_route(&sample()),
@@ -1784,7 +1894,7 @@ mod tests {
     }
 }
 
-/// End-to-end check against a real U60 Pro (root, /data/mihomo installed):
+/// End-to-end check against a real U60 Pro (root, managed Mihomo installed):
 /// `zte_agent-<hash> --ignored --nocapture --test-threads=1 device_e2e`.
 /// Set `E2E_HOLD_SECS` to keep the TUN up for manual client tests.
 #[cfg(test)]

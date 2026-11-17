@@ -192,8 +192,8 @@ regained and this is deployed again.
   TUN, and the forwarding watchdog turns TUN off if mihomo stops forwarding.
   mihomo's controller listens on the LAN address (`:9097`, metacubexd at
   `/ui/`) with the subscription config's secret, or none; the wan zone rejects
-  input, so it is LAN-only. The agent uses the unix socket in `/data/mihomo`
-  (directory 0700).
+  input, so it is LAN-only. The candidate agent uses the unix socket under
+  `/data/u60-pro-managed/mihomo` (directory 0700), separate from legacy data.
   The mainland bypass adds one tagged mangle PREROUTING MARK rule (`-i br-lan`,
   ipset `mihomo-cn`, mark `0x10000000`), ip rule 8999 (`fwmark … lookup
   main`) and the ipset itself. The candidate tracks only the exact resources it

@@ -1,9 +1,9 @@
 //! mihomo process lifecycle, runtime firewall rules for the TUN, and cleanup.
 //!
-//! Nothing here is persisted outside /data/mihomo: the process is started by
-//! the agent (itself started from rc.local), and the iptables accepts and the
-//! TUN's ip rules exist only while mihomo runs. A reboot always returns the
-//! router to its stock forwarding path.
+//! All newly managed Mihomo data lives below /data/u60-pro-managed/mihomo,
+//! separate from the abandoned legacy /data/mihomo tree. The process is
+//! started by the agent, while runtime routes remain owned by Mihomo and are
+//! never swept by generic priority or table cleanup.
 
 use std::fs::{self, OpenOptions};
 use std::os::unix::process::CommandExt;
@@ -14,13 +14,14 @@ use std::time::{Duration, Instant};
 use crate::process::BoundedCommand;
 
 use super::config::{LAN_BRIDGE, TUN_DEVICE};
+use super::paths;
 
-pub const DIR: &str = "/data/mihomo";
-pub const BINARY: &str = "/data/mihomo/mihomo";
-pub const CONFIG: &str = "/data/mihomo/config.yaml";
-pub const STAGED: &str = "/data/mihomo/config.staged.yaml";
-pub const LOG: &str = "/tmp/mihomo.log";
-const PIDFILE: &str = "/var/run/mihomo.pid";
+pub const DIR: &str = paths::MIHOMO_DIR;
+pub const BINARY: &str = paths::MIHOMO_BINARY;
+pub const CONFIG: &str = paths::MIHOMO_CONFIG;
+pub const STAGED: &str = paths::MIHOMO_STAGED_CONFIG;
+pub const LOG: &str = paths::MIHOMO_LOG;
+const PIDFILE: &str = paths::MIHOMO_PID;
 const LOG_CAP: u64 = 1024 * 1024;
 const FW_COMMENT: &str = "mihomo-tun";
 /// sing-tun's default ip rule priority range and route table.
@@ -431,7 +432,7 @@ pub fn preflight_routing(tun_enabled: bool) -> Result<(), String> {
 // sing-tun's (8999 < 9000) sends marked packets through the main table, so
 // they keep the stock path and IPA offload. Runtime only, like the accepts.
 
-pub const CN_LIST: &str = "/data/mihomo/cn.list";
+pub const CN_LIST: &str = paths::MIHOMO_CN_LIST;
 const CN_SET: &str = "mihomo-cn";
 const BYPASS_MARK: &str = "0x10000000/0x10000000";
 const BYPASS_PREF: &str = "8999";
@@ -891,5 +892,19 @@ mod tests {
             parse_bypass_rule_state("9000: from all lookup 2022\n"),
             (0, 0)
         );
+    }
+
+    #[test]
+    fn existing_bypass_signature_does_not_create_an_ownership_lease() {
+        let listing = "8999: from all fwmark 0x10000000/0x10000000 lookup main\n";
+        assert_eq!(parse_bypass_rule_state(listing), (1, 1));
+        assert!(BypassLease::default().is_empty());
+        assert!(FirewallLease::default().is_empty());
+    }
+
+    #[test]
+    fn manager_reads_only_its_new_mihomo_pid_path() {
+        assert_eq!(PIDFILE, paths::MIHOMO_PID);
+        assert_ne!(PIDFILE, "/var/run/mihomo.pid");
     }
 }

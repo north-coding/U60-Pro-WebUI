@@ -12,9 +12,9 @@ use serde_json::{json, Map, Value};
 /// it serves at `/ui`. Its secret is the subscription config's own, else none.
 pub const CONTROLLER_PORT: u16 = 9097;
 /// The controller's unix socket, used by the agent (no secret on the socket).
-pub const CONTROLLER_SOCKET: &str = "/data/mihomo/mihomo.sock";
-/// metacubexd, installed by scripts/deploy-mihomo.sh (`external-ui: ui`).
-pub const UI_DIR: &str = "/data/mihomo/ui";
+pub const CONTROLLER_SOCKET: &str = super::paths::MIHOMO_CONTROLLER_SOCKET;
+/// metacubexd, installed under the managed runtime (`external-ui: ui`).
+pub const UI_DIR: &str = super::paths::MIHOMO_UI;
 /// TUN interface name (also used in the runtime firewall rules).
 pub const TUN_DEVICE: &str = "mihomo";
 /// The only interface whose traffic the TUN captures. The router's own

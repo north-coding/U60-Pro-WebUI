@@ -1,3 +1,4 @@
+import copy
 import json
 import subprocess
 import sys
@@ -42,6 +43,7 @@ def synthetic_inventory():
     artifacts = [
         {
             "id": item["id"],
+            "path": item["path"],
             "present": True,
             "sha256": "b" * 64,
             **({"arch": item["arch"]} if item["arch"] else {}),
@@ -50,13 +52,31 @@ def synthetic_inventory():
     ]
     checks = {name: True for name in MANIFEST["offline_preparation_checks"]}
     checks.update({name: False for name in MANIFEST["activation_checks"]})
+    managed_runtime_paths = [
+        {
+            "path": item["path"],
+            "kind": item["kind"],
+            "classification": item["classification"],
+            "owner_id": item["owner_id"],
+            "present": True,
+            "evidence": {
+                "method": "owner_verified_exact_inventory",
+                "verified": True,
+                "path": item["path"],
+                "owner_id": item["owner_id"],
+            },
+        }
+        for item in MANIFEST["single_instance_storage"]["managed_runtime_paths"]
+    ]
     return {
         "schema_version": 1,
         "source": "synthetic",
         "paths_inventory_complete": True,
         "services_inventory_complete": True,
         "routes_inventory_complete": True,
+        "managed_runtime_inventory_complete": True,
         "paths": paths,
+        "managed_runtime_paths": managed_runtime_paths,
         "services": [
             {"name": item["name"], "owner_id": item["owner_id"], "state": "stopped"}
             for item in MANIFEST["managed_services"]
@@ -130,6 +150,35 @@ class SingleMihomoCutoverValidator(unittest.TestCase):
         result = self.report(state)
         self.assertEqual(result["candidate_actions"], [])
         self.assertTrue(any("unexpected path" in blocker for blocker in result["blockers"]))
+
+    def test_managed_runtime_path_overlapping_legacy_cleanup_blocks_plan(self):
+        state = synthetic_inventory()
+        manifest = copy.deepcopy(MANIFEST)
+        managed = next(
+            item
+            for item in manifest["single_instance_storage"]["managed_runtime_paths"]
+            if item["id"] == "managed-agent-binary"
+        )
+        managed["path"] = "/data/zte-agent"
+        result = validator.validate(manifest, state)
+        self.assertEqual(result["candidate_actions"], [])
+        self.assertTrue(any("overlaps legacy cleanup target" in blocker for blocker in result["blockers"]))
+
+    def test_unknown_or_shared_managed_runtime_owner_blocks_plan(self):
+        for ownership in ("unknown", "shared"):
+            with self.subTest(ownership=ownership):
+                state = synthetic_inventory()
+                state["managed_runtime_paths"][0]["classification"] = ownership
+                result = self.report(state)
+                self.assertEqual(result["candidate_actions"], [])
+                self.assertTrue(any("managed runtime" in blocker for blocker in result["blockers"]))
+
+    def test_cleanup_inventory_cannot_alias_managed_runtime(self):
+        state = synthetic_inventory()
+        state["managed_runtime_paths"][0]["path"] = "/data/zte-agent"
+        result = self.report(state)
+        self.assertEqual(result["candidate_actions"], [])
+        self.assertTrue(any("overlaps a cleanup target" in blocker for blocker in result["blockers"]))
 
     def test_active_managed_service_blocks_cleanup_plan(self):
         state = synthetic_inventory()

@@ -61,6 +61,48 @@
     "/zteoverlay",
     "/sys/class/net"
   ],
+  "single_instance_storage": {
+    "root": "/data/u60-pro-managed",
+    "execution_mode": "one-agent-one-mihomo",
+    "legacy_data_is_migrated": false,
+    "owner_id": "u60-proxy-managed",
+    "runtime_owners": [
+      {"owner_id": "u60-proxy-agent", "classification": "project_owned"},
+      {"owner_id": "managed-mihomo", "classification": "mihomo_owned"},
+      {"owner_id": "u60-proxy-managed", "classification": "project_owned"}
+    ],
+    "staging_path": "/data/u60-pro-managed/staging",
+    "staging_is_temporary": true,
+    "managed_runtime_paths": [
+      {"id": "managed-agent-dir", "path": "/data/u60-pro-managed/agent", "kind": "directory", "classification": "project_owned", "owner_id": "u60-proxy-agent"},
+      {"id": "managed-agent-binary", "path": "/data/u60-pro-managed/agent/zte-agent", "kind": "file", "classification": "project_owned", "owner_id": "u60-proxy-agent"},
+      {"id": "managed-agent-startup", "path": "/data/u60-pro-managed/agent/start-proxy-agent.sh", "kind": "file", "classification": "project_owned", "owner_id": "u60-proxy-agent"},
+      {"id": "managed-mihomo-dir", "path": "/data/u60-pro-managed/mihomo", "kind": "directory", "classification": "mihomo_owned", "owner_id": "managed-mihomo"},
+      {"id": "managed-mihomo-binary", "path": "/data/u60-pro-managed/mihomo/mihomo", "kind": "file", "classification": "mihomo_owned", "owner_id": "managed-mihomo"},
+      {"id": "managed-mihomo-config", "path": "/data/u60-pro-managed/mihomo/config.yaml", "kind": "file", "classification": "mihomo_owned", "owner_id": "managed-mihomo"},
+      {"id": "managed-mihomo-staged-config", "path": "/data/u60-pro-managed/mihomo/config.staged.yaml", "kind": "file", "classification": "mihomo_owned", "owner_id": "managed-mihomo"},
+      {"id": "managed-mihomo-state", "path": "/data/u60-pro-managed/mihomo/manager.json", "kind": "file", "classification": "mihomo_owned", "owner_id": "managed-mihomo"},
+      {"id": "managed-mihomo-providers", "path": "/data/u60-pro-managed/mihomo/providers", "kind": "directory", "classification": "mihomo_owned", "owner_id": "managed-mihomo"},
+      {"id": "managed-mihomo-profiles", "path": "/data/u60-pro-managed/mihomo/profiles", "kind": "directory", "classification": "mihomo_owned", "owner_id": "managed-mihomo"},
+      {"id": "managed-mihomo-cn-list", "path": "/data/u60-pro-managed/mihomo/cn.list", "kind": "file", "classification": "mihomo_owned", "owner_id": "managed-mihomo"},
+      {"id": "managed-mihomo-controller-socket", "path": "/data/u60-pro-managed/mihomo/mihomo.sock", "kind": "socket", "classification": "mihomo_owned", "owner_id": "managed-mihomo"},
+      {"id": "managed-mihomo-ui", "path": "/data/u60-pro-managed/mihomo/ui", "kind": "directory", "classification": "mihomo_owned", "owner_id": "managed-mihomo"},
+      {"id": "managed-mihomo-log", "path": "/data/u60-pro-managed/mihomo/mihomo.log", "kind": "file", "classification": "mihomo_owned", "owner_id": "managed-mihomo"},
+      {"id": "managed-mihomo-pid", "path": "/data/u60-pro-managed/mihomo/mihomo.pid", "kind": "file", "classification": "mihomo_owned", "owner_id": "managed-mihomo"},
+      {"id": "temporary-staging-dir", "path": "/data/u60-pro-managed/staging", "kind": "directory", "classification": "project_owned", "owner_id": "u60-proxy-managed", "temporary": true},
+      {"id": "temporary-rollback-snapshot", "path": "/data/u60-pro-managed/staging/rollback-snapshot.json", "kind": "file", "classification": "project_owned", "owner_id": "u60-proxy-managed", "temporary": true}
+    ],
+    "cleanup_separation": "Every managed runtime path must remain disjoint from every legacy cleanup target. Unknown, shared, or overlapping ownership blocks all cleanup planning."
+  },
+  "legacy_installers": [
+    {
+      "id": "legacy-mihomo-installer",
+      "path": "scripts/deploy-mihomo.sh",
+      "writes_to": "/data/mihomo",
+      "permitted_for_managed_runtime": false,
+      "status": "legacy_only_not_for_cutover"
+    }
+  ],
   "candidate_cleanup_targets": [
     {
       "id": "legacy-agent-binary",
@@ -157,19 +199,22 @@
       "classification": "project_owned",
       "owner_id": "u60-project-agent",
       "exact_entry": "sh /data/local/tmp/start_zte_agent.sh",
+      "replacement_entry": "sh /data/u60-pro-managed/agent/start-proxy-agent.sh --proxy-only",
       "action": "replace_exact_entry_only"
     }
   ],
   "managed_services": [
     {"name": "zte-agent", "owner_id": "u60-project-agent"},
-    {"name": "mihomo", "owner_id": "legacy-mihomo"}
+    {"name": "legacy-mihomo", "owner_id": "legacy-mihomo"},
+    {"name": "proxy-only-agent", "owner_id": "u60-proxy-agent"},
+    {"name": "managed-mihomo", "owner_id": "managed-mihomo"}
   ],
   "required_artifacts": [
-    {"id": "new-agent", "arch": "aarch64", "purpose": "staged authenticated proxy-management Agent"},
-    {"id": "mihomo-binary", "arch": "aarch64", "purpose": "single new managed Mihomo binary"},
-    {"id": "fresh-mihomo-config", "arch": null, "purpose": "generated from new managed settings; no old config import"},
-    {"id": "new-startup-script", "arch": null, "purpose": "explicit proxy-management-only startup invocation"},
-    {"id": "rollback-snapshot", "arch": null, "purpose": "project Agent/startup and rc.local baseline only; excludes abandoned Mihomo configuration and provider data"}
+    {"id": "new-agent", "path": "/data/u60-pro-managed/agent/zte-agent", "arch": "aarch64", "purpose": "staged authenticated proxy-management Agent"},
+    {"id": "mihomo-binary", "path": "/data/u60-pro-managed/mihomo/mihomo", "arch": "aarch64", "purpose": "single new managed Mihomo binary"},
+    {"id": "fresh-mihomo-config", "path": "/data/u60-pro-managed/mihomo/config.yaml", "arch": null, "purpose": "generated from new managed settings; no old config import"},
+    {"id": "new-startup-script", "path": "/data/u60-pro-managed/agent/start-proxy-agent.sh", "arch": null, "purpose": "explicit proxy-management-only startup invocation"},
+    {"id": "rollback-snapshot", "path": "/data/u60-pro-managed/staging/rollback-snapshot.json", "arch": null, "purpose": "project Agent/startup and rc.local baseline only; excludes abandoned Mihomo configuration and provider data"}
   ],
   "rollback_scope": {
     "preserve": ["the complete pre-change rc.local body", "exact project-owned startup line", "existing auth inputs without exposing them", "stock router services"],

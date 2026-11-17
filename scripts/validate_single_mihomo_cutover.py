@@ -46,10 +46,84 @@ def under(path: PurePosixPath, parent: PurePosixPath) -> bool:
     return path != parent and parent in path.parents
 
 
+def overlaps(left: PurePosixPath, right: PurePosixPath) -> bool:
+    return left == right or under(left, right) or under(right, left)
+
+
 def validate(manifest: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     blockers: list[str] = []
     candidates = manifest.get("candidate_cleanup_targets", [])
     target_by_path = {item["path"]: item for item in candidates}
+    storage = manifest.get("single_instance_storage", {})
+    runtime_root_text = storage.get("root") if isinstance(storage, dict) else None
+    runtime_owner_rows = storage.get("runtime_owners", []) if isinstance(storage, dict) else []
+    runtime_owners = {
+        item["owner_id"]: item["classification"]
+        for item in runtime_owner_rows
+        if isinstance(item, dict)
+        and isinstance(item.get("owner_id"), str)
+        and isinstance(item.get("classification"), str)
+    }
+    runtime_entries = storage.get("managed_runtime_paths", []) if isinstance(storage, dict) else []
+    runtime_by_path: dict[str, dict[str, Any]] = {}
+
+    if not canonical_absolute_path(runtime_root_text):
+        blockers.append("managed runtime root is missing or non-canonical")
+        runtime_root = None
+    else:
+        runtime_root = PurePosixPath(runtime_root_text)
+    if not isinstance(storage, dict) or storage.get("execution_mode") != "one-agent-one-mihomo":
+        blockers.append("managed storage must describe one Agent and one Mihomo")
+    if not isinstance(storage, dict) or storage.get("legacy_data_is_migrated") is not False:
+        blockers.append("managed storage must explicitly disable legacy data migration")
+    if not isinstance(runtime_entries, list):
+        runtime_entries = []
+        blockers.append("managed runtime path manifest is missing or malformed")
+    if not isinstance(runtime_owner_rows, list) or not runtime_owners:
+        blockers.append("managed runtime ownership classes are missing or malformed")
+    for entry in runtime_entries:
+        if not isinstance(entry, dict):
+            blockers.append("managed runtime path manifest contains a malformed record")
+            continue
+        path_text = entry.get("path")
+        if not canonical_absolute_path(path_text):
+            blockers.append(f"managed runtime path is non-canonical: {path_text!r}")
+            continue
+        if path_text in runtime_by_path:
+            blockers.append(f"duplicate managed runtime path: {path_text}")
+            continue
+        runtime_by_path[path_text] = entry
+        path = PurePosixPath(path_text)
+        if runtime_root is None or not under(path, runtime_root):
+            blockers.append(f"managed runtime path is outside its root: {path_text}")
+        owner_id = entry.get("owner_id")
+        expected_class = runtime_owners.get(owner_id) if isinstance(owner_id, str) else None
+        if expected_class not in {"project_owned", "mihomo_owned"}:
+            blockers.append(f"managed runtime path has unknown or shared owner: {path_text}")
+        if entry.get("classification") != expected_class:
+            blockers.append(f"managed runtime owner/class mismatch: {path_text}")
+        if entry.get("kind") not in {"file", "directory", "socket", "symlink"}:
+            blockers.append(f"managed runtime path has unsupported kind: {path_text}")
+        for target in candidates:
+            target_text = target.get("path") if isinstance(target, dict) else None
+            if canonical_absolute_path(target_text) and overlaps(path, PurePosixPath(target_text)):
+                blockers.append(
+                    f"managed runtime path overlaps legacy cleanup target: {path_text} <> {target_text}"
+                )
+
+    for installer in manifest.get("legacy_installers", []):
+        if not isinstance(installer, dict):
+            blockers.append("legacy installer manifest contains a malformed record")
+            continue
+        writes_to = installer.get("writes_to")
+        if installer.get("permitted_for_managed_runtime") is not False:
+            blockers.append(f"legacy installer is not disabled for cutover: {installer.get('id')}")
+        if not canonical_absolute_path(writes_to):
+            blockers.append(f"legacy installer target is non-canonical: {installer.get('id')}")
+            continue
+        if runtime_root and overlaps(PurePosixPath(writes_to), runtime_root):
+            blockers.append(f"legacy installer overlaps managed runtime root: {installer.get('id')}")
+
     protected_values = set(manifest.get("protected_paths", []))
     for component in manifest.get("protected_components", []):
         if component.get("classification") != "stock_zte_protected":
@@ -126,6 +200,8 @@ def validate(manifest: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
             continue
         path_records[path_text] = resource
         path = PurePosixPath(path_text)
+        if any(overlaps(path, PurePosixPath(runtime_path)) for runtime_path in runtime_by_path):
+            blockers.append(f"cleanup inventory overlaps managed runtime path: {path_text}")
 
         target = target_by_path.get(path_text)
         parent_target = next(
@@ -152,9 +228,10 @@ def validate(manifest: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
         expected = target or parent_target
         if target and resource.get("kind") != target["kind"]:
             blockers.append(f"resource kind mismatch for {path_text}")
-        if resource.get("classification") not in OWNER_CLASSES:
+        classification = resource.get("classification")
+        if not isinstance(classification, str) or classification not in OWNER_CLASSES:
             blockers.append(f"unknown ownership classification for {path_text}")
-        if resource.get("classification") != expected["classification"]:
+        if classification != expected["classification"]:
             blockers.append(f"ownership class mismatch for {path_text}")
         if resource.get("owner_id") != expected["owner_id"]:
             blockers.append(f"owner identity mismatch for {path_text}")
@@ -217,6 +294,57 @@ def validate(manifest: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
         if any(under(PurePosixPath(path_text), root) for path_text in path_records):
             blockers.append(f"directory root is missing from its child inventory: {target['path']}")
 
+    if state.get("managed_runtime_inventory_complete") is not True:
+        blockers.append("managed runtime path inventory is incomplete")
+    runtime_inventory = state.get("managed_runtime_paths")
+    if not isinstance(runtime_inventory, list):
+        runtime_inventory = []
+        blockers.append("managed runtime path inventory is missing or malformed")
+    seen_runtime_paths: set[str] = set()
+    for resource in runtime_inventory:
+        if not isinstance(resource, dict):
+            blockers.append("managed runtime path inventory contains a malformed record")
+            continue
+        path_text = resource.get("path")
+        if not canonical_absolute_path(path_text):
+            blockers.append(f"managed runtime inventory has a non-canonical path: {path_text!r}")
+            continue
+        if path_text in seen_runtime_paths:
+            blockers.append(f"duplicate managed runtime inventory path: {path_text}")
+            continue
+        seen_runtime_paths.add(path_text)
+        expected = runtime_by_path.get(path_text)
+        path = PurePosixPath(path_text)
+        if any(
+            canonical_absolute_path(target.get("path"))
+            and overlaps(path, PurePosixPath(target["path"]))
+            for target in candidates
+            if isinstance(target, dict)
+        ):
+            blockers.append(f"managed runtime inventory overlaps a cleanup target: {path_text}")
+        if expected is None:
+            blockers.append(f"unexpected managed runtime path: {path_text}")
+            continue
+        if resource.get("kind") != expected.get("kind"):
+            blockers.append(f"managed runtime kind mismatch: {path_text}")
+        if resource.get("classification") != expected.get("classification"):
+            blockers.append(f"managed runtime ownership class mismatch: {path_text}")
+        if resource.get("owner_id") != expected.get("owner_id"):
+            blockers.append(f"managed runtime owner mismatch: {path_text}")
+        if resource.get("present") is not True and resource.get("present") is not False:
+            blockers.append(f"managed runtime presence is unknown: {path_text}")
+        if resource.get("present") is True:
+            evidence = resource.get("evidence")
+            if not isinstance(evidence, dict) or (
+                evidence.get("method") != "owner_verified_exact_inventory"
+                or evidence.get("verified") is not True
+                or evidence.get("path") != path_text
+                or evidence.get("owner_id") != expected.get("owner_id")
+            ):
+                blockers.append(f"managed runtime ownership evidence is missing: {path_text}")
+    for missing in sorted(set(runtime_by_path) - seen_runtime_paths):
+        blockers.append(f"managed runtime inventory is missing: {missing}")
+
     services = state.get("services")
     if not isinstance(services, list):
         services = []
@@ -224,7 +352,11 @@ def validate(manifest: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     managed = {item["name"]: item["owner_id"] for item in manifest.get("managed_services", [])}
     seen_services: set[str] = set()
     for service in services:
-        if not isinstance(service, dict) or service.get("name") not in managed:
+        if (
+            not isinstance(service, dict)
+            or not isinstance(service.get("name"), str)
+            or service["name"] not in managed
+        ):
             blockers.append("service inventory contains an unknown service")
             continue
         if service["name"] in seen_services:
@@ -246,7 +378,11 @@ def validate(manifest: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
     low, high = manifest["routing_policy"]["conflict_rule_priority_range"]
     route_table = str(manifest["routing_policy"]["conflict_route_table"])
     for route in routes:
-        if not isinstance(route, dict) or route.get("classification") not in OWNER_CLASSES:
+        if (
+            not isinstance(route, dict)
+            or not isinstance(route.get("classification"), str)
+            or route["classification"] not in OWNER_CLASSES
+        ):
             blockers.append("route inventory contains unknown ownership")
             continue
         if route.get("classification") == "unknown":
@@ -261,13 +397,22 @@ def validate(manifest: dict[str, Any], state: dict[str, Any]) -> dict[str, Any]:
         artifacts = []
         blockers.append("artifact inventory is missing or malformed")
     artifact_by_id = {
-        item.get("id"): item for item in artifacts if isinstance(item, dict) and item.get("id")
+        item["id"]: item
+        for item in artifacts
+        if isinstance(item, dict) and isinstance(item.get("id"), str) and item["id"]
     }
     for required in manifest.get("required_artifacts", []):
         artifact = artifact_by_id.get(required["id"])
         if not artifact or artifact.get("present") is not True:
             blockers.append(f"required artifact is missing: {required['id']}")
             continue
+        artifact_path = required.get("path")
+        if not canonical_absolute_path(artifact_path):
+            blockers.append(f"required artifact path is non-canonical: {required['id']}")
+        elif artifact_path not in runtime_by_path:
+            blockers.append(f"required artifact path is not an owned runtime path: {required['id']}")
+        elif artifact.get("path") != artifact_path:
+            blockers.append(f"required artifact path evidence does not match: {required['id']}")
         if not SHA256.fullmatch(str(artifact.get("sha256", ""))):
             blockers.append(f"artifact hash is missing or malformed: {required['id']}")
         if required.get("arch") and artifact.get("arch") != required["arch"]:
