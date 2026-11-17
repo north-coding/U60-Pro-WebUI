@@ -23,6 +23,25 @@ Owner: north-coding. Development host: Mac Dev only. This ledger tracks **tempor
 | `/tmp/u60-g1a-after-rebase-tests-20261117.log` | G1-A | Final host-side Python 80/80 tests after branch rebase | PENDING_CLEANUP | After G1-A PR completion |
 | `/tmp/u60-g1a-pr-body-20261117.md` | G1-A | Draft PR #2 description and scope | PENDING_CLEANUP | After PR #2 completion |
 
-Next review: after G1-A Draft PR review, before any G1-B device-facing SSH installer work. Only the Owner-approved lifecycle may authorize deleting authoritative evidence or worktrees with unresolved recovery value. **No cleanup performed in G0/G1-A.**
+| `/Users/north/Developer/Worktrees/u60-pro-webui-g1b-20261117` | G1-B | Isolated offline coexistence planner, synthetic tests and architecture; stacked on G1-A | RETAIN / DRAFT_CANDIDATE | After G1-B PR lifecycle decision |
+| `/tmp/u60-g1a-focused-notice-contract-20261117.md` | G1-A | Scoped CLI authorization notice task | PENDING_CLEANUP | After PR #2 lifecycle decision |
+| `/tmp/u60-g1a-focused-notice-codex-20261117.log` | G1-A | Implementation agent record and sandbox limitation | PENDING_CLEANUP | After PR #2 lifecycle decision |
+| `/tmp/u60-g1a-full-local-after-notice-20261117.log` | G1-A | 81/81 host-side Python test evidence | PENDING_CLEANUP | After PR #2 lifecycle decision |
+| `/tmp/u60-g1b-offline-contract-20261117.md` | G1-B | Scoped design / offline implementation task contract | PENDING_CLEANUP | After G1-B PR lifecycle decision |
+| `/tmp/u60-g1b-offline-codex-20261117.log` | G1-B | Partial agent execution evidence; session terminated after prolonged inactivity; resulting files separately verified | PENDING_CLEANUP | After G1-B PR lifecycle decision |
+| `/tmp/u60-g1b-local-tests-20261117.log` | G1-B | Local offline and regression test evidence (when generated) | PENDING_CLEANUP | After G1-B PR lifecycle decision |
+
+| `/tmp/u60-g1b-focused-review-20261117.md` | G1-B | Focused ChatGPT exact-diff/surrounding-source review; startup side-effect finding and disposition | PENDING_CLEANUP | After Draft PR #3 final review |
+| `/tmp/u60-g1b-review-remediate-task-20261117.md` | G1-B | Scoped Codex follow-up contract for review finding | PENDING_CLEANUP | After PR #3 lifecycle decision |
+| `/tmp/u60-g1b-review-remediate-codex-20261117.log` | G1-B | Interrupted overbroad source scan; no edits; preserved for cost/traceability | PENDING_CLEANUP | After PR #3 lifecycle decision |
+| `/tmp/u60-g1b-reviewed-local-tests-20261117.log` | G1-B | Post-remediation local test and safety check record | PENDING_CLEANUP | After PR #3 lifecycle decision |
+| `/tmp/u60-g1b-draft-pr-body-20261117.md` | G1-B | Draft PR #3 description and review disposition | PENDING_CLEANUP | After PR #3 lifecycle decision |
+
+| `/Users/north/Developer/U60-BuildTools` | G1-C | Project-local verified Rust 1.100.0 minimal toolchain, ARM64 musl std target, Cargo cache, native/target check outputs and validation logs; no global PATH changes | RETAIN / PENDING_CLEANUP | After G1-C build and review evidence retention decision |
+| `/Users/north/Developer/Worktrees/u60-pro-webui-g1b-20261117/web-app/node_modules` | G1-C | Locked npm install (241 packages), needed for local UI verification | PENDING_CLEANUP | Once G1-C UI build validation no longer needs incremental tests |
+| `/Users/north/Developer/Worktrees/u60-pro-webui-g1b-20261117/web-app/dist` | G1-C | Regenerable local TypeScript/Vite build output | PENDING_CLEANUP | After G1-C UI build evidence archived |
+| `/tmp/u60-g1c-frontend-local-20261117.log` | G1-C | npm ci/build/lint/275 Node tests evidence for G1-B head 9deff002 | PENDING_CLEANUP | After G1-C local validation report finalized |
+
+Next review: after G1-B offline focused audit; before any G1-B device-facing SSH installer work. Only the Owner-approved lifecycle may authorize deleting authoritative evidence or worktrees with unresolved recovery value. **No cleanup performed in G0/G1-A.**
 
 No GitHub Actions/CI is authorized; local tests and proportionate independent review are the evidence source.
