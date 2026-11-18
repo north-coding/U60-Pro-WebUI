@@ -13,8 +13,10 @@ pub const MIHOMO_CONTROLLER_SOCKET: &str = "/data/u60-pro-managed/mihomo/mihomo.
 pub const MIHOMO_UI: &str = "/data/u60-pro-managed/mihomo/ui";
 pub const MIHOMO_LOG: &str = "/data/u60-pro-managed/mihomo/mihomo.log";
 pub const MIHOMO_PID: &str = "/data/u60-pro-managed/mihomo/mihomo.pid";
+pub const MIHOMO_LOCK: &str = "/data/u60-pro-managed/mihomo/manager.lock";
 pub const AUTH_DIR: &str = "/data/u60-pro-managed/auth";
 pub const AUTH_SALT: &str = "/data/u60-pro-managed/auth/salt";
+pub const AUTH_PASSWORD: &str = "/data/u60-pro-managed/auth/password";
 
 #[cfg(test)]
 mod tests {
@@ -42,8 +44,10 @@ mod tests {
             MIHOMO_UI,
             MIHOMO_LOG,
             MIHOMO_PID,
+            MIHOMO_LOCK,
             AUTH_DIR,
             AUTH_SALT,
+            AUTH_PASSWORD,
         ];
         let legacy = [
             "/data/zte-agent",

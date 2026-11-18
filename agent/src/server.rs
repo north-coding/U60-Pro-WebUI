@@ -106,6 +106,11 @@ pub fn start(threads: usize, state: Arc<AppState>) {
 /// Minimal API listener used only by `--proxy-only`. It constructs no legacy
 /// AppState and dispatches only the explicit proxy-management allowlist.
 pub fn start_proxy_only(bind: SocketAddr, state: Arc<ProxyOnlyState>) -> Result<(), String> {
+    if !bind.ip().is_loopback() {
+        return Err(
+            "proxy-only management may bind only to loopback until HTTPS is provided".into(),
+        );
+    }
     let server = Server::http(bind.to_string())
         .map_err(|error| format!("could not bind proxy-only API on {bind}: {error}"))?;
     eprintln!("[proxy-only] API listening on {bind}");
@@ -119,7 +124,7 @@ pub fn start_proxy_only(bind: SocketAddr, state: Arc<ProxyOnlyState>) -> Result<
         let state = Arc::clone(&state);
         let failed = Arc::clone(&failed);
         workers.push(thread::spawn(move || loop {
-            if failed.load(Ordering::Relaxed) {
+            if failed.load(Ordering::Relaxed) || state.shutdown.load(Ordering::Acquire) {
                 return;
             }
             match server.recv_timeout(WORKER_POLL) {
@@ -136,11 +141,16 @@ pub fn start_proxy_only(bind: SocketAddr, state: Arc<ProxyOnlyState>) -> Result<
     for worker in workers {
         let _ = worker.join();
     }
+    if state.shutdown.load(Ordering::Acquire) {
+        return Ok(());
+    }
     Err(format!("proxy-only listener on {bind} stopped"))
 }
 
 fn proxy_only_methods(path: &str) -> Option<&'static [&'static str]> {
     match path {
+        "/api/proxy/capabilities" => Some(&["GET"]),
+        "/api/proxy/agent/stop" => Some(&["POST"]),
         "/api/auth/login" => Some(&["POST"]),
         "/api/proxy/status" => Some(&["GET"]),
         "/api/proxy/settings" => Some(&["PUT"]),
@@ -178,10 +188,10 @@ fn proxy_only_origin_allowed(origin: &str, bind: SocketAddr) -> bool {
         std::net::IpAddr::V6(_) => return false,
     };
     if bound_ip.is_loopback() {
-        host.eq_ignore_ascii_case("localhost")
-            || host
-                .parse::<std::net::Ipv4Addr>()
-                .is_ok_and(|ip| ip.is_loopback())
+        let webui_port = matches!(port, Some(5173 | 8080));
+        webui_port
+            && (host.eq_ignore_ascii_case("localhost")
+                || host.parse::<std::net::Ipv4Addr>().ok() == Some(bound_ip))
     } else {
         host.parse::<std::net::Ipv4Addr>().ok() == Some(bound_ip) && port == Some(8080)
     }
@@ -262,6 +272,20 @@ fn handle_proxy_only_request(mut request: Request, state: &ProxyOnlyState, bind:
         return;
     }
 
+    if method == Method::Get && path == "/api/proxy/capabilities" {
+        respond_proxy_only(
+            request,
+            200,
+            json!({"ok": true, "data": {
+                "mode": "proxy_only",
+                "auth_required": true,
+                "features": ["proxy_management"]
+            }}),
+            origin_ref,
+        );
+        return;
+    }
+
     let client_ip = request
         .remote_addr()
         .map(|address| address.ip().to_string())
@@ -291,8 +315,10 @@ fn handle_proxy_only_request(mut request: Request, state: &ProxyOnlyState, bind:
         }
     }
 
-    if path == "/api/proxy/subscriptions/delete"
-        && proxy_only_request_header(&request, "X-Confirm") != Some("true")
+    if matches!(
+        path,
+        "/api/proxy/subscriptions/delete" | "/api/proxy/agent/stop"
+    ) && proxy_only_request_header(&request, "X-Confirm") != Some("true")
     {
         respond_proxy_only(
             request,
@@ -322,6 +348,52 @@ fn handle_proxy_only_request(mut request: Request, state: &ProxyOnlyState, bind:
             request,
             413,
             json!({"ok": false, "error": "request body exceeds 1 MiB"}),
+            origin_ref,
+        );
+        return;
+    }
+
+    if path == "/api/proxy/agent/stop" {
+        let parsed: Value = match serde_json::from_slice::<Value>(&body) {
+            Ok(value) if value.is_object() => value,
+            _ => {
+                respond_proxy_only(
+                    request,
+                    400,
+                    json!({"ok": false, "error": "expected a JSON object"}),
+                    origin_ref,
+                );
+                return;
+            }
+        };
+        let preserve_mihomo = match parsed.get("preserve_mihomo") {
+            None => false,
+            Some(Value::Bool(value)) => *value,
+            Some(_) => {
+                respond_proxy_only(
+                    request,
+                    400,
+                    json!({"ok": false, "error": "preserve_mihomo must be a boolean"}),
+                    origin_ref,
+                );
+                return;
+            }
+        };
+        if !preserve_mihomo {
+            let (status, response) = state.mihomo.service(br#"{"action":"stop"}"#);
+            if status >= 400 {
+                respond_proxy_only(request, status, response, origin_ref);
+                return;
+            }
+        }
+        state.shutdown.store(true, Ordering::Release);
+        respond_proxy_only(
+            request,
+            200,
+            json!({"ok": true, "data": {
+                "stopping": true,
+                "mihomo_preserved": preserve_mihomo
+            }}),
             origin_ref,
         );
         return;
@@ -494,11 +566,14 @@ fn handle_request(mut request: Request, state: &AppState) {
         return;
     }
 
+    // A small unauthenticated capability probe lets the dashboard avoid
+    // mounting unrelated router pages or pollers against proxy-only Agent.
     // The LAN confirmation nonce authorises only the pending change. It lets
     // the browser prove connectivity without sending its session bearer token
     // to a new IP that might already be occupied by another host.
-    let needs_auth =
-        path != "/api/auth/login" && !(method == Method::Post && path == "/api/router/lan/confirm");
+    let needs_auth = path != "/api/auth/login"
+        && path != "/api/proxy/capabilities"
+        && !(method == Method::Post && path == "/api/router/lan/confirm");
     if needs_auth {
         let authorized = request
             .headers()
@@ -629,6 +704,14 @@ pub fn route(
     match (method, path) {
         // Auth
         (&Method::Post, "/api/auth/login") => handlers::login(state, body, client_ip, user_agent),
+        (&Method::Get, "/api/proxy/capabilities") => (
+            200,
+            json!({"ok": true, "data": {
+                "mode": "full",
+                "auth_required": true,
+                "features": ["router_management", "proxy_management"]
+            }}),
+        ),
         // Batch — the dashboard's heartbeat; feeds Home, Signal and Modem/Data
         (&Method::Get, "/api/dashboard") => handlers::dashboard(state),
         // Device / system
@@ -1139,6 +1222,22 @@ mod tests {
     fn proxy_only_http_authenticates_and_serves_synthetic_subscription_state() {
         let server = smoke_server();
 
+        let (status, _, capabilities) =
+            http(server.address, "GET", "/api/proxy/capabilities", &[], "");
+        assert_eq!(status, 200);
+        assert!(capabilities.contains("\"mode\":\"proxy_only\""));
+        assert_eq!(
+            http(
+                server.address,
+                "POST",
+                "/api/proxy/agent/stop",
+                &[("X-Confirm", "true")],
+                r#"{"preserve_mihomo":true}"#,
+            )
+            .0,
+            401
+        );
+
         assert_eq!(
             http(server.address, "GET", "/api/proxy/subscriptions", &[], "").0,
             401
@@ -1246,6 +1345,19 @@ mod tests {
             .0,
             400
         );
+        let (status, _, stop_body) = http(
+            server.address,
+            "POST",
+            "/api/proxy/agent/stop",
+            &[
+                ("Authorization", &authorization),
+                ("Content-Type", "application/json"),
+                ("X-Confirm", "true"),
+            ],
+            r#"{"preserve_mihomo":true}"#,
+        );
+        assert_eq!(status, 200);
+        assert!(stop_body.contains("\"mihomo_preserved\":true"));
     }
 
     #[test]
@@ -1266,7 +1378,7 @@ mod tests {
             "OPTIONS",
             "/api/proxy/status",
             &[
-                ("Origin", "http://localhost:3000"),
+                ("Origin", "http://localhost:5173"),
                 ("Access-Control-Request-Method", "DELETE"),
                 ("Access-Control-Request-Headers", "authorization"),
             ],
@@ -1280,7 +1392,7 @@ mod tests {
             "OPTIONS",
             "/api/proxy/status",
             &[
-                ("Origin", "http://localhost:3000"),
+                ("Origin", "http://localhost:5173"),
                 ("Access-Control-Request-Method", "GET"),
                 (
                     "Access-Control-Request-Headers",
@@ -1290,8 +1402,26 @@ mod tests {
             "",
         );
         assert_eq!(status, 204);
-        assert!(headers.contains("Access-Control-Allow-Origin: http://localhost:3000"));
+        assert!(headers.contains("Access-Control-Allow-Origin: http://localhost:5173"));
         assert!(!headers.contains("Access-Control-Allow-Credentials"));
+
+        let bind = "127.0.0.1:9090".parse().unwrap();
+        assert!(super::proxy_only_origin_allowed(
+            "http://localhost:5173",
+            bind
+        ));
+        assert!(super::proxy_only_origin_allowed(
+            "http://127.0.0.1:8080",
+            bind
+        ));
+        assert!(!super::proxy_only_origin_allowed(
+            "http://localhost:3000",
+            bind
+        ));
+        assert!(!super::proxy_only_origin_allowed(
+            "http://127.0.0.2:5173",
+            bind
+        ));
     }
 
     #[test]

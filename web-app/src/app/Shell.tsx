@@ -33,12 +33,16 @@ export default function Shell({
   onNavigate,
   theme,
   onToggleTheme,
+  proxyOnly = false,
+  onLogout,
   children,
 }: {
   group: Group
   onNavigate: (g: Group) => void
   theme: 'light' | 'dark'
   onToggleTheme: () => void
+  proxyOnly?: boolean
+  onLogout?: () => void
   children: ReactNode
 }) {
   // Lock body scroll while nothing needs it; keeps mobile address bar behavior sane.
@@ -48,6 +52,7 @@ export default function Shell({
 
   const themeIcon =
     theme === 'dark' ? <ISun size={17} /> : <IMoon size={17} />
+  const navigation = proxyOnly ? NAV.filter((item) => item.id === 'proxy') : NAV
 
   return (
     <div className="flex h-full bg-bg">
@@ -62,7 +67,7 @@ export default function Shell({
         </div>
 
         <nav aria-label={t('Main')} className="flex-1 space-y-0.5 px-3">
-          {NAV.map((item) => (
+          {navigation.map((item) => (
             <button
               key={item.id}
               onClick={() => onNavigate(item.id)}
@@ -87,6 +92,14 @@ export default function Shell({
             {themeIcon}
             {theme === 'dark' ? t('Light mode') : t('Dark mode')}
           </button>
+          {onLogout && (
+            <button
+              onClick={onLogout}
+              className="mt-2 flex min-h-11 items-center gap-2 text-meta font-medium text-ink2 transition-colors hover:text-ink"
+            >
+              {t('Sign out')}
+            </button>
+          )}
         </div>
       </aside>
 
@@ -98,18 +111,28 @@ export default function Shell({
           style={{ paddingTop: 'env(safe-area-inset-top)' }}
         >
           <span className="font-display text-base font-semibold tracking-[-0.01em] text-ink">{GROUP_TITLES[group]}</span>
-          <button
-            onClick={onToggleTheme}
-            className="flex h-8 w-8 items-center justify-center rounded-ctl text-ink2 transition-colors hover:bg-surface2 hover:text-ink coarse:h-11 coarse:w-11"
-            aria-label={t('Toggle theme')}
-          >
-            {themeIcon}
-          </button>
+          <div className="flex items-center gap-1">
+            {onLogout && (
+              <button
+                onClick={onLogout}
+                className="min-h-11 rounded-ctl px-2 text-meta font-semibold text-ink2 transition-colors hover:bg-surface2 hover:text-ink"
+              >
+                {t('Sign out')}
+              </button>
+            )}
+            <button
+              onClick={onToggleTheme}
+              className="flex h-8 w-8 items-center justify-center rounded-ctl text-ink2 transition-colors hover:bg-surface2 hover:text-ink coarse:h-11 coarse:w-11"
+              aria-label={t('Toggle theme')}
+            >
+              {themeIcon}
+            </button>
+          </div>
         </header>
 
         <main tabIndex={-1} className="min-h-0 flex-1 overflow-y-auto">
           <div className="mx-auto w-full max-w-shell px-4 pb-24 pt-4 lg:px-6 lg:pb-10 lg:pt-6">
-            <AlertBanner />
+            {!proxyOnly && <AlertBanner />}
             <Suspense
               fallback={
                 <div className="flex justify-center py-20 text-ink3">
@@ -129,7 +152,7 @@ export default function Shell({
           style={{ paddingBottom: 'env(safe-area-inset-bottom)' }}
         >
           <div className="mx-auto flex max-w-md items-stretch justify-around">
-            {NAV.map((item) => {
+            {navigation.map((item) => {
               const active = group === item.id
               return (
                 <button

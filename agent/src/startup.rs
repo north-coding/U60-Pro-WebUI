@@ -15,7 +15,6 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<StartupMode, Stri
 
     let mut proxy_only = false;
     let mut bind = None;
-    let mut lan_confirmed = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -31,8 +30,12 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<StartupMode, Stri
                 bind = Some(parse_ipv4_socket(value)?);
                 i += 1;
             }
-            "--proxy-lan-confirm" if !lan_confirmed => lan_confirmed = true,
-            "--proxy-lan-confirm" => return Err("duplicate --proxy-lan-confirm".into()),
+            "--proxy-lan-confirm" => {
+                return Err(
+                    "LAN binding is disabled until a secure HTTPS management path is available"
+                        .into(),
+                )
+            }
             unknown => return Err(format!("unsupported argument '{unknown}'")),
         }
         i += 1;
@@ -48,12 +51,8 @@ pub fn parse(args: impl IntoIterator<Item = String>) -> Result<StartupMode, Stri
         std::net::IpAddr::V6(_) => return Err("proxy-only accepts IPv4 bind addresses only".into()),
     };
 
-    if ip.is_loopback() {
-        if lan_confirmed {
-            return Err("--proxy-lan-confirm is only valid for a private LAN address".into());
-        }
-    } else if !ip.is_private() || !lan_confirmed {
-        return Err("a private LAN bind requires --proxy-lan-confirm".into());
+    if !ip.is_loopback() {
+        return Err("proxy-only management is loopback-only until HTTPS is provided".into());
     }
 
     Ok(StartupMode::ProxyOnly { bind })
@@ -140,6 +139,7 @@ mod tests {
             "192.168.0.1:9090",
             "--proxy-lan-confirm"
         ]))
-        .is_ok());
+        .unwrap_err()
+        .contains("HTTPS"));
     }
 }

@@ -43,7 +43,7 @@ is a route below — `scripts/check-api-contract.py` enforces both directions
 | USB | `GET /api/usb/status`, `PUT /api/usb/mode`, `/api/usb/default`, `/api/usb/powerbank` |
 | Power | `GET+PUT /api/device/charge-control` — manual stop/resume + limit enforcer with hysteresis, event-driven off `BSP_CHARGER_EVENT` |
 | Extras | TTL clamping (`GET /api/ttl/status`, `PUT /api/ttl/set`, `DELETE /api/ttl/clear`), AT console (`POST /api/at/send`, `GET /api/at/port`), signal/connection CSV loggers (`/api/logger/*`) |
-| Proxy (mihomo) | `GET /api/proxy/status`; `PUT /api/proxy/settings` (mode, preset, tun, cn_bypass, mixed_port); `POST /api/proxy/service` (start/stop/restart); `GET`/`POST`/`PUT /api/proxy/subscriptions`, `POST /api/proxy/subscriptions/delete` (X-Confirm), `POST /api/proxy/subscriptions/update`; `GET`/`PUT /api/proxy/groups`; `POST /api/proxy/delay`. Plus unauthenticated `GET /proxy.pac` for LAN devices |
+| Proxy (mihomo) | `GET /api/proxy/capabilities` (public mode probe); `GET /api/proxy/status`; `PUT /api/proxy/settings` (mode, preset, tun, cn_bypass, mixed_port); `POST /api/proxy/service` (start/stop/restart); `GET`/`POST`/`PUT /api/proxy/subscriptions`, `POST /api/proxy/subscriptions/delete` (X-Confirm), `POST /api/proxy/subscriptions/update`; `GET`/`PUT /api/proxy/groups`; `POST /api/proxy/delay`. Proxy-only Agent also provides authenticated `POST /api/proxy/agent/stop` (X-Confirm; `{preserve_mihomo: true}` keeps the verified process available for recovery). Plus unauthenticated `GET /proxy.pac` for legacy LAN devices |
 
 ## Architecture notes
 
@@ -55,6 +55,18 @@ is a route below — `scripts/check-api-contract.py` enforces both directions
 - **Dependencies**: `serde`, `serde_json`, `tiny_http`, `sha2`, `libc`. No TLS
   stack and no HTTP client — removing the DoH proxy, SMS forwarder and speed
   test dropped `ureq`, and with it rustls/ring/ICU.
+
+### Dashboard compatibility boundary
+
+The dashboard probes `GET /api/proxy/capabilities` without sending a session
+token before it mounts management pages. The proxy-only Agent reports that
+capability publicly; on a remote plain-HTTP page the dashboard clears any old
+token and blocks password entry for proxy-only mode. The existing full Agent's
+legacy HTTP behavior remains available for compatibility. An older full Agent
+that returns 401 for the unauthenticated capability probe is treated as full;
+an unreachable or otherwise unknown Agent stays unavailable. This preserves
+legacy operation, but full-mode HTTP credentials remain a legacy transport
+risk until that API is retired or served through HTTPS.
 - **Subprocess cost**: every `ubus`/`uci` read is a fork+exec, which dominates
   the agent's CPU (about 4–5 ms per `ubus call` on-device). `cache.rs` gives
   each dashboard source its own TTL (signal 1 s, WAN throughput 1 s, thermal 10 s, wan/wan6 30 s, data usage 30 s, cycle dates 300 s), so
@@ -100,24 +112,29 @@ is a route below — `scripts/check-api-contract.py` enforces both directions
 ### Isolated proxy-only startup
 
 The explicit `--proxy-only` startup mode parses and validates its arguments
-before the legacy Agent initializes. It requires a nonempty
-`ZTE_AGENT_PASSWORD`; it does not read the legacy startup script for secrets.
-The default listener is `127.0.0.1:9090`. A private IPv4 LAN bind requires an
-explicit `--proxy-bind ADDRESS:PORT --proxy-lan-confirm` pair and the same
-credential check. Unknown or conflicting arguments fail before startup.
+before the legacy Agent initializes. The managed launcher supplies
+`ZTE_AGENT_PASSWORD_FILE=/data/u60-pro-managed/auth/password`; the Agent
+requires the private, root-owned 0600 file and does not put the credential in
+its process environment. `ZTE_AGENT_PASSWORD` remains available only for
+manual development runs and is unset by the managed launcher. The default
+listener is `127.0.0.1:9090`. Non-loopback binding is rejected until an HTTPS
+management path is implemented and reviewed; the existing WebUI server on
+port 8080 and Agent API on port 9090 use plain HTTP. Unknown or conflicting
+arguments fail before startup.
 
 This mode constructs only password authentication and the Mihomo manager. It
 does not run migration cleanup, EventBus, charge or SMS workers, traffic
 logging, TTL scripts, USB enforcement, LAN recovery, or unrelated device
 service initialization. Only the login route and exact `/api/proxy/*`
 management methods are dispatched; every management request requires a valid
-Bearer token, and unrelated router routes return 404. CORS is limited to
-loopback origins or the dashboard origin at the configured private bind IP on
-port 8080. The LAN API bind uses port 9090 to match the existing WebUI
-contract. The password
+Bearer token, and unrelated router routes return 404. The public capability
+probe contains no secrets and lets the dashboard select proxy-only UI without
+mounting router pollers. The dashboard withholds credentials on a remote
+plain-HTTP page. The password
 salt is stored at `/data/u60-pro-managed/auth/salt` (file mode 0600, directory
 mode 0700). Startup rejects a missing or unowned managed root, symlinked
-state, or Mihomo state/directory with permissive modes. A missing Mihomo
+state/config/log paths, invalid process-owner records, or Mihomo state/runtime
+paths with unexpected ownership or permissions. A missing Mihomo
 directory is created only at its exact manifest path with mode 0700 when the
 first config is written.
 

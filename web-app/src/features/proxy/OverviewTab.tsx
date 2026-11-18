@@ -88,10 +88,10 @@ export default function OverviewTab({ status }: { status: PollResult<ProxyStatus
           <div className="flex gap-2">
             {s.running ? (
               <>
-                <Button size="sm" variant="ghost" onClick={() => void service('restart')} loading={busy === 'restart'} disabled={!!busy}>
+                <Button size="sm" variant="ghost" onClick={() => void service('restart')} loading={busy === 'restart'} disabled={!!busy || s.lifecycle === 'blocked'}>
                   {t('Restart')}
                 </Button>
-                <Button size="sm" variant="outline" onClick={() => void service('stop')} loading={busy === 'stop'} disabled={!!busy}>
+                <Button size="sm" variant="outline" onClick={() => void service('stop')} loading={busy === 'stop'} disabled={!!busy || s.lifecycle === 'blocked'}>
                   {t('Stop')}
                 </Button>
               </>
@@ -101,7 +101,7 @@ export default function OverviewTab({ status }: { status: PollResult<ProxyStatus
                 variant="primary"
                 onClick={() => void service('start')}
                 loading={busy === 'start'}
-                disabled={!!busy || !s.installed}
+                disabled={!!busy || !s.installed || s.lifecycle === 'blocked'}
               >
                 {t('Start')}
               </Button>
@@ -144,7 +144,7 @@ export default function OverviewTab({ status }: { status: PollResult<ProxyStatus
               options={MODE_OPTIONS}
               value={mode}
               onChange={setModeDraft}
-              disabled={!!busy}
+              disabled={!!busy || s.lifecycle === 'blocked'}
             />
             {modeDraft && modeDraft !== s.mode && (
               <Button variant="primary" onClick={() => void applyMode()} loading={busy === 'mode'}>

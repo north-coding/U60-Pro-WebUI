@@ -56,6 +56,9 @@ test('service state distinguishes missing core, failing and stopped', () => {
   assert.equal(view.serviceState({ ...base, enabled: true }).label, 'Starting')
   assert.equal(view.serviceState({ ...base, enabled: true, last_error: 'bind failed' }).label, 'Failing')
   assert.equal(view.serviceState(base).label, 'Stopped')
+  assert.deepEqual(view.serviceState({ ...base, running: true, lifecycle: 'recovering' }), { label: 'Recovering', tone: 'warn' })
+  assert.deepEqual(view.serviceState({ ...base, running: true, lifecycle: 'blocked' }), { label: 'Blocked', tone: 'danger' })
+  assert.deepEqual(view.serviceState({ ...base, enabled: true, lifecycle: 'stopped' }), { label: 'Stopped', tone: 'default' })
 })
 
 test('new subscriptions default to manual-only updates', () => {

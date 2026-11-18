@@ -16,6 +16,7 @@
 
 mod config;
 mod controller;
+mod ownership;
 mod paths;
 mod profile;
 mod service;
@@ -38,6 +39,7 @@ const STATE_FILE: &str = paths::MIHOMO_STATE;
 const PROVIDERS_DIR: &str = paths::MIHOMO_PROVIDERS;
 pub const PROXY_AUTH_SALT: &str = paths::AUTH_SALT;
 pub const PROXY_AUTH_DIR: &str = paths::AUTH_DIR;
+pub const PROXY_AUTH_PASSWORD: &str = paths::AUTH_PASSWORD;
 const TICK: Duration = Duration::from_secs(5);
 const FIREWALL_CHECK_EVERY: Duration = Duration::from_secs(15);
 const CRASH_WINDOW: Duration = Duration::from_secs(600);
@@ -57,6 +59,9 @@ const GROUP_TYPES: &[&str] = &["Selector", "URLTest", "Fallback", "LoadBalance",
 
 pub struct Manager {
     inner: Mutex<Inner>,
+    /// Held for the complete lifetime of a proxy-only Agent manager. A crash
+    /// releases the kernel lock without deleting the stable lock file.
+    _lifecycle_lock: Option<service::ManagerLock>,
 }
 
 struct Inner {
@@ -71,6 +76,8 @@ struct Inner {
     retry_at: Option<Instant>,
     last_error: Option<String>,
     notice: Option<String>,
+    blocked_reason: Option<String>,
+    recovery_pending: bool,
     sub_errors: HashMap<String, String>,
     traffic: Option<(Instant, u64, u64)>,
     firewall_checked: Option<Instant>,
@@ -250,16 +257,40 @@ fn usage_json(u: &config::Usage) -> Value {
 
 impl Manager {
     pub fn new() -> Self {
-        Self::build(service::adopt(), PathBuf::from(STATE_FILE), false)
+        let mut manager = Self::build(None, PathBuf::from(STATE_FILE), false);
+        match service::acquire_manager_lock() {
+            Ok(lock) => manager._lifecycle_lock = Some(lock),
+            Err(error) => {
+                manager.lock().blocked_reason = Some(format!(
+                    "managed Mihomo lifecycle lock is unavailable: {error}"
+                ));
+            }
+        }
+        manager
     }
 
     /// Proxy-only mode deliberately does not inspect, adopt, or remove a PID
     /// record left by another Agent process.
     pub fn new_proxy_only() -> Result<Self, String> {
+        service::ensure_proxy_only_runtime_dir()?;
+        let lifecycle_lock = service::acquire_manager_lock()?;
         service::validate_proxy_only_paths()?;
         let state_file = PathBuf::from(STATE_FILE);
         let state = load_proxy_only_state(&state_file)?;
-        Ok(Self::build_with_state(None, state_file, true, state))
+        let (process, blocked_reason) = match service::recover_proxy_only_process() {
+            service::Recovery::Stopped => (None, None),
+            service::Recovery::Running(process) => (Some(*process), None),
+            service::Recovery::Blocked(reason) => (None, Some(reason)),
+        };
+        let recovering = process.is_some();
+        let mut manager = Self::build_with_state(process, state_file, true, state);
+        manager._lifecycle_lock = Some(lifecycle_lock);
+        {
+            let mut inner = manager.lock();
+            inner.blocked_reason = blocked_reason;
+            inner.recovery_pending = recovering;
+        }
+        Ok(manager)
     }
 
     fn build(process: Option<Process>, state_file: PathBuf, proxy_only: bool) -> Self {
@@ -289,6 +320,8 @@ impl Manager {
                 retry_at: None,
                 last_error: None,
                 notice: None,
+                blocked_reason: None,
+                recovery_pending: false,
                 sub_errors: HashMap::new(),
                 traffic: None,
                 firewall_checked: None,
@@ -299,6 +332,7 @@ impl Manager {
                 profile_attempt: None,
                 health: Health::default(),
             }),
+            _lifecycle_lock: None,
         }
     }
 
@@ -321,10 +355,17 @@ impl Manager {
             std::thread::sleep(Duration::from_secs(10));
             // An upgraded agent may render a different config (new fixes);
             // bring an adopted mihomo in line once.
-            me.lock().reconcile();
+            {
+                let mut inner = me.lock();
+                inner.reconcile_recovery();
+            }
             let mut ticks: u64 = 0;
             loop {
-                me.lock().tick();
+                {
+                    let mut inner = me.lock();
+                    inner.reconcile_recovery();
+                    inner.tick();
+                }
                 // Probe without holding the lock: it can take several seconds.
                 // Bind first: the guard must be released before the block re-locks.
                 let probe_due = me.lock().probe_due();
@@ -365,6 +406,10 @@ impl Manager {
     /// Download `sub` (without holding the lock) and, if it is still the
     /// same subscription, store the result and re-apply the config.
     fn refresh_profile(&self, sub: &Subscription) -> Result<(), String> {
+        let mutation_block = self.lock().mutation_block_reason();
+        if let Some(reason) = mutation_block {
+            return Err(format!("proxy manager is unavailable: {reason}"));
+        }
         let fetched = profile::fetch(sub);
         let mut inner = self.lock();
         let Some(idx) = inner
@@ -392,6 +437,31 @@ impl Manager {
 }
 
 impl Inner {
+    fn mutation_block_reason(&self) -> Option<String> {
+        self.blocked_reason.clone().or_else(|| {
+            self.recovery_pending.then(|| {
+                "proxy manager is still recovering; retry after status reconciliation".into()
+            })
+        })
+    }
+
+    fn reconcile_recovery(&mut self) {
+        if !self.recovery_pending {
+            return;
+        }
+        // The mutex excludes API mutations while the internal reconciliation
+        // runs. Temporarily clear the gate so a required controlled restart can
+        // use the same transition checks as an explicit user action.
+        self.recovery_pending = false;
+        match self.reconcile() {
+            Ok(()) => self.last_error = None,
+            Err(error) => {
+                self.last_error = Some(error);
+                self.recovery_pending = true;
+            }
+        }
+    }
+
     /// The secret metacubexd needs: whatever the live config sets ("" = none).
     fn live_panel_secret(&mut self) -> String {
         let Ok(modified) = fs::metadata(service::CONFIG).and_then(|m| m.modified()) else {
@@ -412,7 +482,15 @@ impl Inner {
     }
 
     fn alive(&mut self) -> bool {
-        self.process.as_mut().is_some_and(Process::alive)
+        let result = self.process.as_mut().map(Process::verify_alive);
+        match result {
+            Some(Ok(alive)) => alive,
+            Some(Err(error)) => {
+                self.blocked_reason = Some(error);
+                false
+            }
+            None => false,
+        }
     }
 
     fn find_sub(&self, id: &str) -> Option<usize> {
@@ -426,16 +504,25 @@ impl Inner {
 
     /// Re-render the config and, if it differs from the installed file,
     /// validate, install and hot-reload it (e.g. after an agent upgrade).
-    fn reconcile(&mut self) {
-        if !self.state.settings.enabled || !self.alive() {
-            return;
+    fn reconcile(&mut self) -> Result<(), String> {
+        if let Some(reason) = &self.blocked_reason {
+            return Err(format!("proxy manager is blocked: {reason}"));
         }
-        let Ok(ip) = lan_ip() else { return };
+        if !self.state.settings.enabled {
+            if self.process.is_some() {
+                self.stop()?;
+            }
+            return Ok(());
+        }
+        if !self.alive() {
+            return self
+                .blocked_reason
+                .as_ref()
+                .map_or(Ok(()), |reason| Err(reason.clone()));
+        }
+        let ip = lan_ip()?;
         let base = match &self.state.settings.profile {
-            Some(id) => match profile::load(id) {
-                Ok(v) => Some(v),
-                Err(_) => return,
-            },
+            Some(id) => Some(profile::load(id)?),
             None => None,
         };
         let rendered = if self.proxy_only {
@@ -443,23 +530,21 @@ impl Inner {
         } else {
             config::render(&self.state, &ip, base.as_ref(), service::ui_installed())
         };
-        let Ok(rendered) = rendered else {
-            return;
-        };
-        let Ok(bytes) = serde_json::to_vec_pretty(&rendered) else {
-            return;
-        };
+        let rendered = rendered?;
+        let bytes = serde_json::to_vec_pretty(&rendered).map_err(|error| error.to_string())?;
         if fs::read(service::CONFIG).ok().as_deref() == Some(bytes.as_slice()) {
             // The file is current; is the running controller? (Agents before
             // this check hot-reloaded secret changes, which mihomo ignores.)
-            let addr = format!("{ip}:{}", config::CONTROLLER_PORT);
-            if service::controller_accepts(&addr, &file_secret(&bytes)) == Some(false) {
-                match self.restart() {
-                    Ok(()) => eprintln!("[mihomo] controller secret was out of date; restarted"),
-                    Err(e) => self.last_error = Some(e),
+            if self.proxy_only {
+                Controller.get("/proxies")?;
+            } else {
+                let addr = format!("{ip}:{}", config::CONTROLLER_PORT);
+                if service::controller_accepts(&addr, &file_secret(&bytes)) == Some(false) {
+                    self.restart()?;
+                    eprintln!("[mihomo] controller secret was out of date; restarted");
                 }
             }
-            return;
+            return Ok(());
         }
         let state = self.state.clone();
         // An older agent ran mihomo without the controller socket: restart it
@@ -479,13 +564,9 @@ impl Inner {
         } else {
             preflight_then(|| service::preflight_routing(state.settings.tun), reconcile)
         };
-        match result {
-            Ok(()) => eprintln!("[mihomo] config updated to this agent version and reloaded"),
-            Err(e) => {
-                eprintln!("[mihomo] could not apply the updated config: {e}");
-                self.last_error = Some(e);
-            }
-        }
+        result?;
+        eprintln!("[mihomo] config updated to this agent version and reloaded");
+        Ok(())
     }
 
     /// The mixed-port proxy URL when a forwarding check is due.
@@ -608,6 +689,9 @@ impl Inner {
     }
 
     fn tick(&mut self) {
+        if self.blocked_reason.is_some() {
+            return;
+        }
         // Reap an exited process and remember why it died.
         if self.process.is_some() && !self.alive() {
             self.process = None;
@@ -620,6 +704,9 @@ impl Inner {
             );
             self.remove_owned_firewall();
             self.sync_bypass();
+        }
+        if self.blocked_reason.is_some() {
+            return;
         }
         while self
             .crashes
@@ -775,6 +862,9 @@ impl Inner {
     }
 
     fn start(&mut self) -> Result<(), String> {
+        if let Some(reason) = &self.blocked_reason {
+            return Err(format!("proxy manager is blocked: {reason}"));
+        }
         if !service::installed() {
             return Err(format!(
                 "mihomo is not installed (expected {})",
@@ -790,7 +880,10 @@ impl Inner {
         // The LAN address may have changed since the file was written.
         let state = self.state.clone();
         preflight_then(
-            || service::preflight_routing(state.settings.tun),
+            || {
+                service::preflight_routing(state.settings.tun)?;
+                service::preflight_proxy_port(&ip, state.settings.mixed_port)
+            },
             || self.write_config(&state),
         )?;
         if self.state.settings.tun {
@@ -828,27 +921,41 @@ impl Inner {
         Ok(())
     }
 
-    fn stop(&mut self) {
-        if let Some(process) = self.process.take() {
-            let forced = process.terminate();
-            eprintln!("[mihomo] stopped{}", if forced { " (killed)" } else { "" });
+    fn stop(&mut self) -> Result<(), String> {
+        if let Some(mut process) = self.process.take() {
+            match process.terminate() {
+                Ok(forced) => {
+                    eprintln!("[mihomo] stopped{}", if forced { " (killed)" } else { "" })
+                }
+                Err(error) => {
+                    self.process = Some(process);
+                    return Err(error);
+                }
+            }
         }
         self.remove_owned_firewall();
         self.traffic = None;
         self.sync_bypass();
+        Ok(())
     }
 
     fn restart(&mut self) -> Result<(), String> {
+        if let Some(reason) = self.mutation_block_reason() {
+            return Err(format!("proxy manager is blocked: {reason}"));
+        }
         // The current routing state cannot be attributed to Mihomo from its
         // priority/table alone. Refuse to stop or restart while any such state
         // is present; callers can stop explicitly and inspect before starting.
         service::preflight_routing(self.state.settings.tun)?;
-        self.stop();
+        self.stop()?;
         self.start()
     }
 
     /// Make `next` the desired state and bring the running process in line.
     fn apply(&mut self, next: State) -> Result<(), String> {
+        if let Some(reason) = self.mutation_block_reason() {
+            return Err(format!("proxy manager is blocked: {reason}"));
+        }
         let previous_state = self.state.clone();
         let running = self.alive();
         let old_file = fs::read(service::CONFIG).ok();
@@ -862,6 +969,9 @@ impl Inner {
             || previous_state.settings.mixed_port != next.settings.mixed_port
             || controller_changed;
         let will_start = transition_starts_process(next.settings.enabled, running, needs_restart);
+        let preflight_ip = if will_start { Some(lan_ip()?) } else { None };
+        let check_candidate_port =
+            !running || next.settings.mixed_port != previous_state.settings.mixed_port;
 
         // The gate encloses every persistent config/state write. If routing
         // ownership cannot be established, apply returns with those files,
@@ -876,7 +986,16 @@ impl Inner {
         };
         let previous_file = if will_start {
             preflight_then(
-                || service::preflight_routing(next.settings.tun),
+                || {
+                    service::preflight_routing(next.settings.tun)?;
+                    if check_candidate_port {
+                        let Some(ip) = preflight_ip.as_deref() else {
+                            return Err("could not read the router's LAN address".into());
+                        };
+                        service::preflight_proxy_port(ip, next.settings.mixed_port)?;
+                    }
+                    Ok(())
+                },
                 install_and_save,
             )?
         } else {
@@ -888,10 +1007,7 @@ impl Inner {
             (true, true) if needs_restart => self.restart(),
             (true, true) => self.reload(),
             (true, false) => self.start(),
-            (false, true) => {
-                self.stop();
-                Ok(())
-            }
+            (false, true) => self.stop(),
             (false, false) => Ok(()),
         };
         if let Err(e) = outcome {
@@ -930,14 +1046,27 @@ impl Inner {
 
     fn status(&mut self) -> Value {
         let running = self.alive();
+        let lifecycle = if self.blocked_reason.is_some() {
+            "blocked"
+        } else if self.recovery_pending {
+            "recovering"
+        } else if running {
+            "running"
+        } else {
+            "stopped"
+        };
         let s = self.state.settings.clone();
         let ip = lan_ip().ok();
         let panel_installed = !self.proxy_only && service::ui_installed();
-        let notice = self.notice.clone().or_else(|| {
-            (self.proxy_only && !running && service::managed_pid_record_present()).then(|| {
-                "an unverified managed PID record blocks process adoption and start".into()
-            })
-        });
+        let notice = self
+            .blocked_reason
+            .clone()
+            .or_else(|| self.notice.clone())
+            .or_else(|| {
+                (self.proxy_only && !running && service::managed_pid_record_present()).then(|| {
+                    "an unverified managed PID record blocks process adoption and start".into()
+                })
+            });
         let mut traffic = Value::Null;
         let mut route = Value::Null;
         if running {
@@ -975,6 +1104,7 @@ impl Inner {
             "installed": service::installed(),
             "version": self.version,
             "running": running,
+            "lifecycle": lifecycle,
             "pid": process.map(|p| p.pid),
             "uptime_secs": process.filter(|_| running).map(|p| p.started.elapsed().as_secs()),
             "rss_bytes": process.filter(|_| running).and_then(Process::rss_bytes),
@@ -1371,6 +1501,9 @@ impl Manager {
         let use_config = v["use_config"].as_bool().unwrap_or(false);
         let id = {
             let inner = self.lock();
+            if let Some(reason) = inner.mutation_block_reason() {
+                return conflict(reason);
+            }
             if let Err(e) = config::can_add_subscription(&inner.state) {
                 return bad(e);
             }
@@ -1438,6 +1571,9 @@ impl Manager {
         }
         let (mut next, idx) = {
             let inner = self.lock();
+            if let Some(reason) = inner.mutation_block_reason() {
+                return conflict(reason);
+            }
             let Some(idx) = inner.find_sub(&id) else {
                 return not_found();
             };
@@ -1535,6 +1671,9 @@ impl Manager {
             return bad("id is required");
         }
         let mut inner = self.lock();
+        if let Some(reason) = inner.mutation_block_reason() {
+            return conflict(reason);
+        }
         let Some(idx) = inner.find_sub(&id) else {
             return not_found();
         };
@@ -1562,6 +1701,9 @@ impl Manager {
         };
         let (running, profile_id, targets) = {
             let mut inner = self.lock();
+            if let Some(reason) = inner.mutation_block_reason() {
+                return conflict(reason);
+            }
             let targets: Vec<Subscription> = match v["id"].as_str() {
                 Some(id) => match inner.find_sub(id) {
                     Some(i) => vec![inner.state.subscriptions[i].clone()],
@@ -1703,9 +1845,14 @@ impl Manager {
         let Some(proxy) = v["proxy"].as_str().filter(|p| !p.is_empty()) else {
             return bad("proxy is required");
         };
-        if !self.lock().alive() {
+        let mut inner = self.lock();
+        if let Some(reason) = inner.mutation_block_reason() {
+            return conflict(reason);
+        }
+        if !inner.alive() {
             return conflict("the proxy is not running");
         }
+        drop(inner);
         let ctl = Controller;
         let path = format!("/proxies/{}", segment(group));
         match ctl.get(&path) {
@@ -1813,6 +1960,8 @@ mod tests {
                     retry_at: None,
                     last_error: None,
                     notice: None,
+                    blocked_reason: None,
+                    recovery_pending: false,
                     sub_errors: HashMap::new(),
                     traffic: None,
                     firewall_checked: None,
@@ -1823,8 +1972,27 @@ mod tests {
                     profile_attempt: None,
                     health: Health::default(),
                 }),
+                _lifecycle_lock: None,
             }
         }
+    }
+
+    #[test]
+    fn lifecycle_status_exposes_recovery_and_blocked_states_and_blocks_mutations() {
+        let manager = Manager::new_for_tests();
+        manager.lock().recovery_pending = true;
+        let (status, body) = manager.status();
+        assert_eq!(status, 200);
+        assert_eq!(body["data"]["lifecycle"], "recovering");
+        let (status, error) = manager.settings_set(br#"{"tun":true}"#);
+        assert_eq!(status, 409);
+        assert!(error["error"].as_str().unwrap().contains("recovering"));
+        assert!(!manager.lock().state.settings.tun);
+
+        manager.lock().blocked_reason = Some("synthetic ownership conflict".into());
+        let (_, body) = manager.status();
+        assert_eq!(body["data"]["lifecycle"], "blocked");
+        assert_eq!(body["data"]["notice"], "synthetic ownership conflict");
     }
 
     fn sample() -> Value {
@@ -1939,6 +2107,40 @@ mod tests {
         );
 
         assert_eq!(result.unwrap_err(), "synthetic routing conflict");
+        assert_eq!(runtime, before);
+    }
+
+    #[test]
+    fn port_conflict_preflight_leaves_runtime_files_and_network_effects_untouched() {
+        #[derive(Clone, Debug, PartialEq, Eq)]
+        struct Runtime {
+            config: Vec<u8>,
+            state: Vec<u8>,
+            routes: Vec<String>,
+            firewall: Vec<String>,
+        }
+
+        let mut runtime = Runtime {
+            config: b"previous-config".to_vec(),
+            state: b"previous-state".to_vec(),
+            routes: vec!["existing-route".into()],
+            firewall: vec!["existing-firewall-rule".into()],
+        };
+        let before = runtime.clone();
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let result = preflight_then(
+            || service::preflight_proxy_port("127.0.0.1", port),
+            || {
+                runtime.config = b"new-config".to_vec();
+                runtime.state = b"new-state".to_vec();
+                runtime.routes.push("new-route".into());
+                runtime.firewall.push("new-firewall-rule".into());
+                Ok(())
+            },
+        );
+
+        assert!(result.unwrap_err().contains("unavailable"));
         assert_eq!(runtime, before);
     }
 

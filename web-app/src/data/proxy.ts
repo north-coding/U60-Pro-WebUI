@@ -42,6 +42,7 @@ export function mapProxyStatus(d: Record<string, unknown>): ProxyStatus {
     installed: boolLike(d.installed) ?? false,
     version: nonEmptyStr(d.version),
     running: boolLike(d.running) ?? false,
+    lifecycle: oneOf(d.lifecycle, ['running', 'stopped', 'recovering', 'blocked']),
     pid: nonNegativeInt(d.pid),
     uptime_secs: nonNegativeInt(d.uptime_secs),
     rss_bytes: nonNegativeInt(d.rss_bytes),

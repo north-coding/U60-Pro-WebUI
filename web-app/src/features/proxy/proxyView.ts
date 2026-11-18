@@ -53,6 +53,9 @@ export function intervalLabel(hours: number): string {
 export function serviceState(s: ProxyStatus | null | undefined): { label: string; tone: ChipTone } {
   if (!s) return { label: t('Unknown'), tone: 'default' }
   if (!s.installed) return { label: t('Not installed'), tone: 'danger' }
+  if (s.lifecycle === 'blocked') return { label: t('Blocked'), tone: 'danger' }
+  if (s.lifecycle === 'recovering') return { label: t('Recovering'), tone: 'warn' }
+  if (s.lifecycle === 'stopped') return { label: t('Stopped'), tone: 'default' }
   if (s.running) return { label: t('Running'), tone: 'ok' }
   if (s.enabled) return { label: s.last_error ? t('Failing') : t('Starting'), tone: s.last_error ? 'danger' : 'warn' }
   return { label: t('Stopped'), tone: 'default' }

@@ -48,11 +48,20 @@ const DEFAULT_THREADS: usize = 4;
 const STARTUP_SCRIPT: &str = "/data/local/tmp/start_zte_agent.sh";
 
 fn main() {
-    let mode = match startup::parse(std::env::args().skip(1)) {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.as_slice() == ["--build-info"] {
+        println!(
+            "zte-agent {} arch={}",
+            env!("CARGO_PKG_VERSION"),
+            std::env::consts::ARCH
+        );
+        return;
+    }
+    let mode = match startup::parse(args) {
         Ok(mode) => mode,
         Err(error) => {
             eprintln!("[agent] invalid startup arguments: {error}");
-            eprintln!("[agent] usage: zte-agent [--proxy-only [--proxy-bind IPV4:PORT --proxy-lan-confirm]]");
+            eprintln!("[agent] usage: zte-agent [--proxy-only [--proxy-bind 127.0.0.1:9090]]");
             std::process::exit(64);
         }
     };

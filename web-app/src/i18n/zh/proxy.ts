@@ -1,5 +1,7 @@
 // Chinese UI strings: Proxy (mihomo). Keys are the English source text passed to t().
 export const proxy: Record<string, string> = {
+  Blocked: '已阻止',
+  Recovering: '正在恢复',
   // Group and tabs
   'mihomo subscriptions, nodes and LAN routing': 'mihomo 订阅、节点与局域网分流',
   Overview: '概览',
