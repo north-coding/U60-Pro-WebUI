@@ -24,8 +24,10 @@ AGENT=$AGENT_DIR/zte-agent
 MIHOMO=$MIHOMO_DIR/mihomo
 CONFIG=$MIHOMO_DIR/config.yaml
 PASSWORD_FILE=$AUTH_DIR/password
+WEBUI_ORIGIN_FILE=$AUTH_DIR/webui-origin
 AGENT_LOG=$AGENT_DIR/agent.log
 API=http://127.0.0.1:9090
+HTTPS_ORIGIN=
 
 fail() { echo "proxy-agent: $*" >&2; exit 1; }
 
@@ -130,6 +132,15 @@ preflight_agent() {
     case "$PASSWORD" in
         ''|*[!A-Za-z0-9_-]*) fail "password file must contain one nonempty base64url-safe password line" ;;
     esac
+    if [ -L "$WEBUI_ORIGIN_FILE" ]; then
+        fail "HTTPS WebUI origin must not be a symbolic link"
+    elif [ -e "$WEBUI_ORIGIN_FILE" ]; then
+        validate_file "$WEBUI_ORIGIN_FILE" 600
+        awk 'NR > 1 { exit 1 } END { if (NR != 1) exit 1 }' "$WEBUI_ORIGIN_FILE" || fail "HTTPS WebUI origin must contain exactly one line"
+        HTTPS_ORIGIN=$(cat "$WEBUI_ORIGIN_FILE")
+        [ -n "$HTTPS_ORIGIN" ] || fail "HTTPS WebUI origin must not be empty"
+        case "$HTTPS_ORIGIN" in https://*) : ;; *) fail "HTTPS WebUI origin must start with https://" ;; esac
+    fi
     validate_binary "$AGENT"
     if [ -L "$AGENT_LOG" ]; then
         fail "Agent log must not be a symbolic link"
@@ -199,8 +210,13 @@ start_agent() {
         result=$?
         [ "$result" -eq 1 ] || fail "an incompatible service already owns API port 9090"
     fi
-    (umask 077; ZTE_AGENT_PASSWORD_FILE="$PASSWORD_FILE" nohup "$AGENT" --proxy-only --proxy-bind 127.0.0.1:9090 \
-        </dev/null >> "$AGENT_LOG" 2>&1 &)
+    if [ -n "$HTTPS_ORIGIN" ]; then
+        (umask 077; ZTE_AGENT_PASSWORD_FILE="$PASSWORD_FILE" nohup "$AGENT" --proxy-only --proxy-bind 127.0.0.1:9090 \
+            --proxy-https-origin "$HTTPS_ORIGIN" </dev/null >> "$AGENT_LOG" 2>&1 &)
+    else
+        (umask 077; ZTE_AGENT_PASSWORD_FILE="$PASSWORD_FILE" nohup "$AGENT" --proxy-only --proxy-bind 127.0.0.1:9090 \
+            </dev/null >> "$AGENT_LOG" 2>&1 &)
+    fi
     wait_for_capability up
     echo "proxy-only Agent is ready on 127.0.0.1:9090"
 }

@@ -8,15 +8,15 @@ const ts = require('typescript')
 const i18nStub = {
   t: (text, vars) => (vars ? text.replace(/\{(\w+)\}/g, (m, k) => (k in vars ? String(vars[k]) : m)) : text),
 }
-function fixture(fetchImpl) {
+function fixture(fetchImpl, location = { protocol: 'http:', hostname: '192.168.0.1', origin: 'http://192.168.0.1:8080' }) {
   const requests = []
   const context = { exports: {}, require: () => i18nStub, AbortController, setTimeout, clearTimeout,
-    window: { location: { hostname: '192.168.0.1' }, dispatchEvent: () => {} },
+    window: { location, dispatchEvent: () => {} },
     sessionStorage: { getItem: () => 'general-session-secret', setItem: () => {}, removeItem: () => {} },
     fetch: async (url, options) => {
       requests.push({ url, options })
       if (fetchImpl) return fetchImpl(url, options)
-      return { ok: true, status: 200, json: async () => ({ ok: true, data: {} }) }
+      return { ok: true, status: 200, json: async () => ({ ok: true, data: url.endsWith('/api/auth/login') ? { token: 'synthetic-login-token' } : {} }) }
     },
   }
   const source = fs.readFileSync(path.join(__dirname, '../src/data/client.ts'), 'utf8')
@@ -25,8 +25,39 @@ function fixture(fetchImpl) {
   } }).outputText, context)
   return { client: context.exports, requests }
 }
+test('HTTPS WebUI uses its same origin for Agent APIs and never targets plaintext port 9090', async () => {
+  const origin = 'https://u60.home.arpa:8443'
+  const { client, requests } = fixture(undefined, { protocol: 'https:', hostname: 'u60.home.arpa', origin })
+  const login = await client.login('synthetic-password')
+  client.setToken(login.token)
+  await client.get('/api/proxy/groups')
+  assert.equal(client.API_BASE, origin)
+  assert.deepEqual(requests.map(request => request.url), [
+    `${origin}/api/auth/login`,
+    `${origin}/api/proxy/groups`,
+  ])
+  assert.ok(requests.every(request => request.url.startsWith('https://')))
+  assert.equal(requests[0].options.headers.Authorization, undefined)
+  assert.equal(requests[1].options.headers.Authorization, 'Bearer synthetic-login-token')
+})
+
+test('HTTPS failures are explicit and never fall back to HTTP; LAN confirmation sends no token', async () => {
+  const origin = 'https://u60.home.arpa:8443'
+  const { client, requests } = fixture(() => Promise.reject(new Error('certificate rejected')), {
+    protocol: 'https:', hostname: 'u60.home.arpa', origin,
+  })
+  await assert.rejects(client.get('/api/proxy/groups'), /HTTPS gateway and trusted certificate/)
+  await assert.rejects(client.readCsv('/api/system/log.csv'), /HTTPS gateway and trusted certificate/)
+  await assert.rejects(client.confirmLan('192.168.2.1', 'one-time-secret'), /cannot send a token over HTTP/)
+  assert.equal(requests.length, 2)
+  assert.equal(requests[0].url, `${origin}/api/proxy/groups`)
+  assert.equal(requests[1].url, `${origin}/api/system/log.csv`)
+  assert.ok(requests.every(request => !request.url.startsWith('http://')))
+})
+
 test('LAN confirmation carries only the scoped nonce to the new address', async () => {
   const { client, requests } = fixture()
+  assert.equal(client.API_BASE, 'http://192.168.0.1:9090')
   await client.confirmLan('192.168.2.1', 'single-use-nonce')
   assert.equal(requests[0].url, 'http://192.168.2.1:9090/api/router/lan/confirm')
   assert.equal(requests[0].options.headers.Authorization, undefined)
