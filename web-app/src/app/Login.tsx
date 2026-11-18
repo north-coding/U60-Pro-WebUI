@@ -13,9 +13,9 @@ function isMobilePinClient() {
   )
 }
 
-export default function Login({ onAuthed }: { onAuthed: () => void }) {
+export default function Login({ onAuthed, proxyOnly = false }: { onAuthed: () => void; proxyOnly?: boolean }) {
   const mobile = isMobilePinClient()
-  const [mode, setMode] = useState<'pin' | 'password'>(mobile ? 'pin' : 'password')
+  const [mode, setMode] = useState<'pin' | 'password'>(mobile && !proxyOnly ? 'pin' : 'password')
   const [pw, setPw] = useState('')
   const [pin, setPin] = useState('')
   const [err, setErr] = useState('')
@@ -53,7 +53,7 @@ export default function Login({ onAuthed }: { onAuthed: () => void }) {
           onSubmit={submit}
           className="space-y-4 rounded-panel border border-line/8 bg-surface p-5"
         >
-          {mobile && (
+          {mobile && !proxyOnly && (
             <div className="flex justify-center">
               <Segmented
                 options={[

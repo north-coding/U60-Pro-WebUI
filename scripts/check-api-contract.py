@@ -48,6 +48,7 @@ MOCK_PAYLOAD_POSTS = {
 }
 
 AGENT_ROUTE_RE = re.compile(r'\(&Method::(\w+),\s*"(/api/[^"]+)"\)')
+PROXY_ONLY_ROUTE_RE = re.compile(r'"(/api/[^"]+)"\s*=>\s*Some\(&\[([^]]*)\]\)')
 
 # Every `/api/...` string literal in a dashboard source.
 API_LITERAL_RE = re.compile(r'''(['"`])(/api/[a-zA-Z0-9/_-]+)\1''')
@@ -77,8 +78,11 @@ def read(path: Path) -> str:
 
 
 def agent_routes(server_rs: str) -> set[Route]:
-    """(METHOD, path) pairs from the route table."""
-    return {(m.upper(), p) for m, p in AGENT_ROUTE_RE.findall(server_rs)}
+    """(METHOD, path) pairs from both the full and proxy-only route tables."""
+    routes = {(m.upper(), p) for m, p in AGENT_ROUTE_RE.findall(server_rs)}
+    for path, methods in PROXY_ONLY_ROUTE_RE.findall(server_rs):
+        routes.update((method.strip().strip('"').upper(), path) for method in methods.split(",") if method.strip())
+    return routes
 
 
 def dashboard_routes(source: str) -> tuple[set[Route], set[str]]:

@@ -1889,6 +1889,7 @@ def proxy_status():
     profile = _profile_sub()
     return {
         "installed": True, "version": "v1.19.32", "running": running,
+        "lifecycle": "running" if running else "stopped",
         "pid": 4321 if running else None,
         "uptime_secs": int(time.time()) - p["started"] if running else None,
         "rss_bytes": int(jitter(48_000_000, 0.05)) if running else None,
@@ -1908,6 +1909,10 @@ def proxy_status():
                    "checked_secs_ago": 12 if running else None, "retested_secs_ago": None},
         "restarts": 0, "last_error": None, "notice": None,
     }
+
+
+def proxy_capabilities():
+    return {"mode": "full", "auth_required": True, "features": ["router_management", "proxy_management"]}
 
 
 def put_proxy_settings(body):
@@ -1943,6 +1948,16 @@ def post_proxy_service(body):
     else:
         raise ApiError(400, "action must be start, stop or restart")
     return proxy_status()
+
+
+def post_proxy_agent_stop(body):
+    obj = need_object(body, None)
+    preserve = obj.get("preserve_mihomo", False)
+    if not isinstance(preserve, bool):
+        raise ApiError(400, "preserve_mihomo must be a boolean")
+    if not preserve:
+        post_proxy_service({"action": "stop"})
+    return {"stopping": True, "mihomo_preserved": preserve}
 
 
 def proxy_subscriptions():
@@ -2188,6 +2203,7 @@ ROUTES_PUT = {
 
 
 ROUTES_GET = {
+    "/api/proxy/capabilities": proxy_capabilities,
     "/api/system/backup": system_backup,
     "/api/cell/operators": carriers,
     "/api/sms/forward": sms_forward,
@@ -2255,6 +2271,7 @@ ROUTES_POST = {
     "/api/router/dhcp-bindings/delete": post_dhcp_binding_delete,
     "/api/network/clients/kick": post_client_kick,
     "/api/proxy/service": post_proxy_service,
+    "/api/proxy/agent/stop": post_proxy_agent_stop,
     "/api/proxy/subscriptions": post_proxy_subscription_add,
     "/api/proxy/subscriptions/delete": post_proxy_subscription_delete,
     "/api/proxy/subscriptions/update": post_proxy_subscription_update,

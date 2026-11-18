@@ -2,7 +2,8 @@
 
 import { t } from '../i18n'
 
-export const API_BASE = `http://${window.location.hostname}:9090`
+const apiProtocol = window.location.protocol === 'https:' ? 'https:' : 'http:'
+export const API_BASE = `${apiProtocol}//${window.location.hostname}:9090`
 export const AUTH_EXPIRED_EVENT = 'zte-auth-expired'
 
 let _token: string | null = sessionStorage.getItem('zte_token')

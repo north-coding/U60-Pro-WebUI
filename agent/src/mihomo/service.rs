@@ -5,9 +5,12 @@
 //! started by the agent, while runtime routes remain owned by Mihomo and are
 //! never swept by generic priority or table cleanup.
 
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Write};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt};
+use std::fs::{self, File, OpenOptions};
+use std::io::Read;
+#[cfg(target_os = "linux")]
+use std::os::fd::FromRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
@@ -16,6 +19,7 @@ use std::time::{Duration, Instant};
 use crate::process::BoundedCommand;
 
 use super::config::{LAN_BRIDGE, TUN_DEVICE};
+use super::ownership::{self, FileIdentity, OwnerRecord, Phase, ProcessEvidence};
 use super::paths;
 
 pub const DIR: &str = paths::MIHOMO_DIR;
@@ -24,6 +28,7 @@ pub const CONFIG: &str = paths::MIHOMO_CONFIG;
 pub const STAGED: &str = paths::MIHOMO_STAGED_CONFIG;
 pub const LOG: &str = paths::MIHOMO_LOG;
 const PIDFILE: &str = paths::MIHOMO_PID;
+const LOCKFILE: &str = paths::MIHOMO_LOCK;
 const LOG_CAP: u64 = 1024 * 1024;
 const FW_COMMENT: &str = "mihomo-tun";
 /// sing-tun's default ip rule priority range and route table.
@@ -34,36 +39,19 @@ pub struct Process {
     child: Option<Child>,
     pub pid: u32,
     pub started: Instant,
-    pid_file: FileIdentity,
+    owner: OwnerRecord,
+    owner_file: FileIdentity,
+    pidfd: OwnedFd,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct FileIdentity {
-    device: u64,
-    inode: u64,
+pub struct ManagerLock {
+    _file: File,
 }
 
-fn file_identity(metadata: &fs::Metadata) -> FileIdentity {
-    FileIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    }
-}
-
-fn remove_pid_record(path: &str, expected_pid: u32, identity: FileIdentity) {
-    let Ok(metadata) = fs::metadata(path) else {
-        return;
-    };
-    if file_identity(&metadata) != identity {
-        return;
-    }
-    if fs::read_to_string(path)
-        .ok()
-        .and_then(|contents| contents.trim().parse::<u32>().ok())
-        == Some(expected_pid)
-    {
-        let _ = fs::remove_file(path);
-    }
+pub enum Recovery {
+    Stopped,
+    Running(Box<Process>),
+    Blocked(String),
 }
 
 #[derive(Default)]
@@ -111,7 +99,7 @@ impl BypassLease {
 }
 
 pub fn installed() -> bool {
-    Path::new(BINARY).is_file()
+    ownership::validate_binary(Path::new(BINARY)).is_ok()
 }
 
 /// Read-only indicator for a record that proxy-only mode will not adopt or
@@ -127,7 +115,22 @@ pub fn validate_proxy_only_paths() -> Result<(), String> {
     let root = Path::new(DIR)
         .parent()
         .ok_or_else(|| "managed Mihomo path has no runtime root".to_string())?;
-    validate_managed_tree(root, Path::new(DIR), Path::new(paths::MIHOMO_STATE))
+    validate_managed_tree(root, Path::new(DIR), Path::new(paths::MIHOMO_STATE))?;
+    for path in [
+        paths::MIHOMO_CONFIG,
+        paths::MIHOMO_STAGED_CONFIG,
+        paths::MIHOMO_LOG,
+        paths::MIHOMO_PID,
+    ] {
+        validate_optional_private_file(Path::new(path))?;
+    }
+    for path in [paths::MIHOMO_PROVIDERS, paths::MIHOMO_PROFILES] {
+        validate_optional_private_directory(Path::new(path))?;
+    }
+    if Path::new(BINARY).exists() {
+        ownership::validate_binary(Path::new(BINARY))?;
+    }
+    validate_controller_socket_path()
 }
 
 /// Create only the exact Mihomo runtime directory under an already validated
@@ -139,6 +142,179 @@ pub fn ensure_proxy_only_runtime_dir() -> Result<(), String> {
     ensure_private_directory(root, Path::new(DIR))
 }
 
+/// Serialize every Agent instance which can manage the new Mihomo runtime.
+/// The kernel releases this advisory lock if the Agent crashes; the lock file
+/// itself is stable and is never deleted as stale state.
+pub fn acquire_manager_lock() -> Result<ManagerLock, String> {
+    acquire_lock_at(Path::new(LOCKFILE))
+}
+
+fn acquire_lock_at(lock_path: &Path) -> Result<ManagerLock, String> {
+    let parent = lock_path
+        .parent()
+        .ok_or_else(|| "managed Mihomo lock path has no parent".to_string())?;
+    let parent_metadata = fs::symlink_metadata(parent)
+        .map_err(|error| format!("managed Mihomo directory is unavailable: {error}"))?;
+    validate_private_directory(parent, &parent_metadata)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(lock_path)
+        .map_err(|error| format!("cannot open managed Mihomo lock: {error}"))?;
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect managed Mihomo lock: {error}"))?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.nlink() != 1
+        || metadata.mode() & 0o7777 != 0o600
+    {
+        return Err("managed Mihomo lock has unexpected type, owner, links, or permissions".into());
+    }
+    let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if result != 0 {
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Err("another Agent instance already owns the managed Mihomo lifecycle".into());
+        }
+        return Err(format!("cannot lock managed Mihomo lifecycle: {error}"));
+    }
+    Ok(ManagerLock { _file: file })
+}
+
+/// Recover only a process whose durable record, PID start ticks, executable,
+/// arguments, owner token, and binary identity all agree.
+pub fn recover_proxy_only_process() -> Recovery {
+    match ownership::inspect_owner(
+        Path::new(PIDFILE),
+        Path::new("/proc"),
+        Path::new(BINARY),
+        Path::new(DIR),
+        Path::new(CONFIG),
+    ) {
+        ownership::Inspection::Stopped => Recovery::Stopped,
+        ownership::Inspection::Blocked(reason) => Recovery::Blocked(reason),
+        ownership::Inspection::Owned {
+            record: record_box,
+            mut file_identity,
+            process: process_box,
+            record_needs_completion,
+        } => {
+            let record = *record_box;
+            let process = *process_box;
+            if record_needs_completion {
+                match ownership::complete_owner_file(Path::new(PIDFILE), file_identity, &record) {
+                    Ok(identity) => file_identity = identity,
+                    Err(error) => return Recovery::Blocked(error),
+                }
+            }
+            let pidfd = match open_verified_pidfd(&record, process.pid) {
+                Ok(pidfd) => pidfd,
+                Err(error) => return Recovery::Blocked(error),
+            };
+            match ownership::inspect_process(Path::new("/proc"), process.pid) {
+                Ok(current) if ownership::matches_record(&record, &current, record.start_ticks) => {
+                    let started = process_age(process.pid)
+                        .and_then(|age| Instant::now().checked_sub(age))
+                        .unwrap_or_else(Instant::now);
+                    Recovery::Running(Box::new(Process {
+                        child: None,
+                        pid: process.pid,
+                        started,
+                        owner: record,
+                        owner_file: file_identity,
+                        pidfd,
+                    }))
+                }
+                Ok(_) => Recovery::Blocked(
+                    "Mihomo identity changed while recovery was being verified".into(),
+                ),
+                Err(error) => {
+                    Recovery::Blocked(format!("cannot recheck recovered Mihomo process: {error}"))
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_verified_pidfd(record: &OwnerRecord, pid: u32) -> Result<OwnedFd, String> {
+    let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) } as libc::c_int;
+    if fd < 0 {
+        return Err(format!(
+            "cannot safely recover Mihomo: pidfd_open failed: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let pidfd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let current = ownership::inspect_process(Path::new("/proc"), pid)
+        .map_err(|error| format!("cannot verify process after pidfd_open: {error}"))?;
+    if !ownership::matches_record(record, &current, record.start_ticks) {
+        return Err("Mihomo process identity changed during pidfd recovery".into());
+    }
+    Ok(pidfd)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn open_verified_pidfd(_record: &OwnerRecord, _pid: u32) -> Result<OwnedFd, String> {
+    Err("safe Mihomo adoption requires Linux pidfd support".into())
+}
+
+fn validate_optional_private_file(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                || !metadata.is_file()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.nlink() != 1
+                || metadata.mode() & 0o7777 != 0o600 =>
+        {
+            Err(format!(
+                "managed file {} has unexpected type, owner, links, or permissions",
+                path.display()
+            ))
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "cannot inspect managed file {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn validate_optional_private_directory(path: &Path) -> Result<(), String> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) => validate_private_directory(path, &metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "cannot inspect managed directory {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+fn validate_controller_socket_path() -> Result<(), String> {
+    let path = Path::new(paths::MIHOMO_CONTROLLER_SOCKET);
+    match fs::symlink_metadata(path) {
+        Ok(metadata)
+            if metadata.file_type().is_symlink()
+                || !metadata.file_type().is_socket()
+                || metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.nlink() != 1
+                || metadata.mode() & 0o077 != 0 =>
+        {
+            Err("managed Mihomo controller socket has unexpected type, owner, links, or permissions".into())
+        }
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!("cannot inspect managed controller socket: {error}")),
+    }
+}
+
 fn validate_managed_tree(root: &Path, mihomo_dir: &Path, state_file: &Path) -> Result<(), String> {
     if mihomo_dir.parent() != Some(root) || state_file.parent() != Some(mihomo_dir) {
         return Err("managed Mihomo paths do not match the declared directory layout".into());
@@ -148,6 +324,7 @@ fn validate_managed_tree(root: &Path, mihomo_dir: &Path, state_file: &Path) -> R
     if root_metadata.file_type().is_symlink()
         || !root_metadata.is_dir()
         || root_metadata.uid() != unsafe { libc::geteuid() }
+        || root_metadata.mode() & 0o7777 != 0o700
     {
         return Err("managed runtime root has unexpected type or owner".into());
     }
@@ -159,20 +336,7 @@ fn validate_managed_tree(root: &Path, mihomo_dir: &Path, state_file: &Path) -> R
     };
     validate_private_directory(mihomo_dir, &directory_metadata)?;
 
-    match fs::symlink_metadata(state_file) {
-        Ok(metadata)
-            if metadata.file_type().is_symlink()
-                || !metadata.is_file()
-                || metadata.uid() != unsafe { libc::geteuid() }
-                || metadata.nlink() != 1
-                || metadata.mode() & 0o7777 != 0o600 =>
-        {
-            Err("managed Mihomo state has unexpected type, owner, links, or permissions".into())
-        }
-        Ok(_) => Ok(()),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(error) => Err(format!("cannot inspect managed Mihomo state: {error}")),
-    }
+    validate_optional_private_file(state_file)
 }
 
 fn ensure_private_directory(root: &Path, mihomo_dir: &Path) -> Result<(), String> {
@@ -184,6 +348,7 @@ fn ensure_private_directory(root: &Path, mihomo_dir: &Path) -> Result<(), String
     if root_metadata.file_type().is_symlink()
         || !root_metadata.is_dir()
         || root_metadata.uid() != unsafe { libc::geteuid() }
+        || root_metadata.mode() & 0o7777 != 0o700
     {
         return Err("managed runtime root has unexpected type or owner".into());
     }
@@ -272,123 +437,148 @@ pub fn log_tail_error() -> Option<String> {
 }
 
 pub fn spawn() -> Result<Process, String> {
-    if !installed() {
-        return Err(format!("mihomo is not installed (expected {BINARY})"));
-    }
+    ensure_proxy_only_runtime_dir()?;
+    let binary = ownership::validate_binary(Path::new(BINARY))?;
+    validate_optional_private_file(Path::new(LOG))?;
+    let prior_log_identity = match fs::symlink_metadata(LOG) {
+        Ok(metadata) => Some(FileIdentity::from_metadata(&metadata)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("cannot inspect {LOG}: {error}")),
+    };
     let log = OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
         .open(LOG)
         .map_err(|e| format!("cannot open {LOG}: {e}"))?;
+    let log_metadata = log
+        .metadata()
+        .map_err(|e| format!("cannot inspect {LOG}: {e}"))?;
+    if !log_metadata.is_file()
+        || log_metadata.uid() != unsafe { libc::geteuid() }
+        || log_metadata.nlink() != 1
+        || log_metadata.mode() & 0o7777 != 0o600
+        || prior_log_identity
+            .is_some_and(|identity| identity != FileIdentity::from_metadata(&log_metadata))
+    {
+        return Err(format!(
+            "managed Mihomo log {LOG} changed or has unexpected ownership/permissions"
+        ));
+    }
     let log_err = log
         .try_clone()
         .map_err(|e| format!("cannot open {LOG}: {e}"))?;
-    // Never overwrite a record left by another Agent. Proxy-only mode does not
-    // adopt or clean up an existing PID record, so this also fails closed on
-    // stale or unverifiable state.
-    let mut pid_record = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(PIDFILE)
-        .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                format!("managed PID record already exists at {PIDFILE}; refusing to adopt or overwrite it")
-            } else {
-                format!("cannot reserve managed PID record {PIDFILE}: {error}")
-            }
-        })?;
+    let owner_token = random_owner_token()?;
+    let owner = ownership::starting_record(
+        Path::new(BINARY),
+        &binary,
+        Path::new(DIR),
+        Path::new(CONFIG),
+        owner_token.clone(),
+    );
+    let mut owner_file = ownership::reserve_owner_file(Path::new(PIDFILE), &owner)?;
     let mut cmd = Command::new(BINARY);
     cmd.args(["-d", DIR, "-f", CONFIG])
         .env("GOMEMLIMIT", "160MiB")
+        .env(ownership::OWNER_TOKEN_ENV, owner_token)
         .stdin(Stdio::null())
         .stdout(log)
         .stderr(log_err);
     // Own session: an agent restart (deploy, crash) must not take mihomo with it.
     unsafe {
         cmd.pre_exec(|| {
-            libc::setsid();
-            Ok(())
+            if libc::setsid() < 0 {
+                Err(std::io::Error::last_os_error())
+            } else {
+                Ok(())
+            }
         });
     }
     let child = match cmd.spawn() {
         Ok(child) => child,
         Err(error) => {
-            remove_reserved_pid_record(&pid_record);
+            let _ = ownership::remove_owner_file(Path::new(PIDFILE), owner_file);
             return Err(format!("failed to start mihomo: {error}"));
         }
     };
     let pid = child.id();
-    if let Err(error) = writeln!(pid_record, "{pid}").and_then(|_| pid_record.sync_all()) {
-        let mut child = child;
-        let _ = child.kill();
-        let _ = child.wait();
-        remove_reserved_pid_record(&pid_record);
-        return Err(format!("cannot write managed PID record: {error}"));
-    }
-    let pid_file = match pid_record.metadata() {
-        Ok(metadata) => file_identity(&metadata),
+    let evidence = match wait_for_process_evidence(pid) {
+        Ok(evidence) if ownership::matches_record(&owner, &evidence, None) => evidence,
+        Ok(_) => {
+            let mut child = child;
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = ownership::remove_owner_file(Path::new(PIDFILE), owner_file);
+            return Err(
+                "new Mihomo process failed executable/argument ownership verification".into(),
+            );
+        }
         Err(error) => {
             let mut child = child;
             let _ = child.kill();
             let _ = child.wait();
-            remove_reserved_pid_record(&pid_record);
-            return Err(format!("cannot verify managed PID record: {error}"));
+            let _ = ownership::remove_owner_file(Path::new(PIDFILE), owner_file);
+            return Err(error);
+        }
+    };
+    let pidfd = match open_verified_pidfd(&owner, pid) {
+        Ok(pidfd) => pidfd,
+        Err(error) => {
+            let mut child = child;
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = ownership::remove_owner_file(Path::new(PIDFILE), owner_file);
+            return Err(error);
+        }
+    };
+    let mut owner = owner;
+    owner.phase = Phase::Running;
+    owner.pid = Some(pid);
+    owner.start_ticks = Some(evidence.start_ticks);
+    owner_file = match ownership::complete_owner_file(Path::new(PIDFILE), owner_file, &owner) {
+        Ok(identity) => identity,
+        Err(error) => {
+            let mut child = child;
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = ownership::remove_owner_file(Path::new(PIDFILE), owner_file);
+            return Err(error);
         }
     };
     Ok(Process {
         child: Some(child),
         pid,
         started: Instant::now(),
-        pid_file,
+        owner,
+        owner_file,
+        pidfd,
     })
 }
 
-fn remove_reserved_pid_record(file: &fs::File) {
-    let Ok(owned) = file.metadata() else { return };
-    let Ok(current) = fs::metadata(PIDFILE) else {
-        return;
-    };
-    if owned.dev() == current.dev() && owned.ino() == current.ino() {
-        let _ = fs::remove_file(PIDFILE);
-    }
+fn random_owner_token() -> Result<String, String> {
+    let mut bytes = [0u8; 32];
+    File::open("/dev/urandom")
+        .and_then(|mut source| source.read_exact(&mut bytes))
+        .map_err(|error| format!("secure process owner token generation failed: {error}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-/// Re-attach to a mihomo started by a previous agent instance.
-pub fn adopt() -> Option<Process> {
-    let record = fs::File::open(PIDFILE).ok()?;
-    let identity = file_identity(&record.metadata().ok()?);
-    let mut contents = String::new();
-    record.take(128).read_to_string(&mut contents).ok()?;
-    let pid: u32 = contents.trim().parse().ok()?;
-    if !pid_is_mihomo(pid) {
-        remove_pid_record(PIDFILE, pid, identity);
-        return None;
+fn wait_for_process_evidence(pid: u32) -> Result<ProcessEvidence, String> {
+    let mut last_error = None;
+    for _ in 0..20 {
+        match ownership::inspect_process(Path::new("/proc"), pid) {
+            Ok(process) => return Ok(process),
+            Err(error) => last_error = Some(error),
+        }
+        std::thread::sleep(Duration::from_millis(50));
     }
-    let started = process_age(pid)
-        .and_then(|age| Instant::now().checked_sub(age))
-        .unwrap_or_else(Instant::now);
-    Some(Process {
-        child: None,
-        pid,
-        started,
-        pid_file: identity,
-    })
-}
-
-fn pid_is_mihomo(pid: u32) -> bool {
-    let cmdline = fs::read(format!("/proc/{pid}/cmdline")).unwrap_or_default();
-    let first = cmdline.split(|&b| b == 0).next().unwrap_or(&[]);
-    if first != BINARY.as_bytes() {
-        return false;
-    }
-    // A zombie still has a cmdline-less /proc entry; treat it as dead.
-    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
-    let state = stat
-        .rsplit(')')
-        .next()
-        .and_then(|s| s.split_whitespace().next());
-    !matches!(state, Some("Z") | Some("X") | None)
+    Err(format!(
+        "cannot verify new Mihomo process: {}",
+        last_error
+            .map(|error| error.to_string())
+            .unwrap_or_else(|| "process identity unavailable".into())
+    ))
 }
 
 fn process_age(pid: u32) -> Option<Duration> {
@@ -412,13 +602,34 @@ fn process_age(pid: u32) -> Option<Duration> {
 }
 
 impl Process {
-    pub fn alive(&mut self) -> bool {
+    pub fn verify_alive(&mut self) -> Result<bool, String> {
         if let Some(child) = self.child.as_mut() {
-            if !matches!(child.try_wait(), Ok(None)) {
-                return false;
+            match child.try_wait() {
+                Ok(None) => {}
+                Ok(Some(_)) => {
+                    self.remove_verified_owner_record()?;
+                    return Ok(false);
+                }
+                Err(error) => return Err(format!("cannot inspect Mihomo child process: {error}")),
             }
         }
-        pid_is_mihomo(self.pid)
+        if pidfd_exited(self.pidfd.as_raw_fd())? {
+            self.remove_verified_owner_record()?;
+            return Ok(false);
+        }
+        let process = ownership::inspect_process(Path::new("/proc"), self.pid)
+            .map_err(|error| format!("cannot verify managed Mihomo process: {error}"))?;
+        if !ownership::matches_record(&self.owner, &process, self.owner.start_ticks) {
+            return Err(
+                "managed Mihomo PID no longer matches its recorded start identity; lifecycle blocked"
+                    .into(),
+            );
+        }
+        Ok(true)
+    }
+
+    pub fn alive(&mut self) -> bool {
+        self.verify_alive().unwrap_or(false)
     }
 
     pub fn rss_bytes(&self) -> Option<u64> {
@@ -441,44 +652,110 @@ impl Process {
             .as_mut()
             .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_))))
         {
-            remove_pid_record(PIDFILE, self.pid, self.pid_file);
+            let _ = self.remove_verified_owner_record();
         }
     }
 
     /// SIGTERM, wait up to 5 s, then SIGKILL. A forced exit can leave TUN
     /// routing resources; the next start detects them and fails closed.
-    pub fn terminate(mut self) -> bool {
-        if self
-            .child
-            .as_mut()
-            .is_some_and(|child| matches!(child.try_wait(), Ok(Some(_))))
-        {
-            remove_pid_record(PIDFILE, self.pid, self.pid_file);
-            return false;
+    pub fn terminate(&mut self) -> Result<bool, String> {
+        if self.process_exited()? {
+            self.remove_verified_owner_record()?;
+            return Ok(false);
         }
-        if self.child.is_none() && !pid_is_mihomo(self.pid) {
-            return false;
-        }
-        let pid = self.pid as libc::pid_t;
-        unsafe { libc::kill(pid, libc::SIGTERM) };
+        self.signal(libc::SIGTERM)?;
         let deadline = Instant::now() + Duration::from_secs(5);
         while Instant::now() < deadline {
-            if !self.alive() {
-                remove_pid_record(PIDFILE, self.pid, self.pid_file);
-                return false;
+            if self.process_exited()? {
+                self.remove_verified_owner_record()?;
+                return Ok(false);
             }
             std::thread::sleep(Duration::from_millis(100));
         }
-        if !self.alive() {
-            remove_pid_record(PIDFILE, self.pid, self.pid_file);
-            return false;
+        if self.process_exited()? {
+            self.remove_verified_owner_record()?;
+            return Ok(false);
         }
-        unsafe { libc::kill(pid, libc::SIGKILL) };
+        self.signal(libc::SIGKILL)?;
         if let Some(mut child) = self.child.take() {
             let _ = child.wait();
         }
-        remove_pid_record(PIDFILE, self.pid, self.pid_file);
-        true
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while Instant::now() < deadline {
+            if self.process_exited()? {
+                self.remove_verified_owner_record()?;
+                return Ok(true);
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        Err("managed Mihomo did not exit after SIGKILL; ownership record retained".into())
+    }
+
+    fn process_exited(&mut self) -> Result<bool, String> {
+        if let Some(child) = self.child.as_mut() {
+            match child.try_wait() {
+                Ok(Some(_)) => return Ok(true),
+                Ok(None) => {}
+                Err(error) => return Err(format!("cannot inspect Mihomo child process: {error}")),
+            }
+        }
+        pidfd_exited(self.pidfd.as_raw_fd())
+    }
+
+    fn signal(&self, number: libc::c_int) -> Result<(), String> {
+        let process = ownership::inspect_process(Path::new("/proc"), self.pid)
+            .map_err(|error| format!("cannot re-verify managed Mihomo before stop: {error}"))?;
+        if !ownership::matches_record(&self.owner, &process, self.owner.start_ticks) {
+            return Err("managed Mihomo identity changed; refusing to signal it".into());
+        }
+        send_pidfd_signal(self.pidfd.as_raw_fd(), number)
+    }
+
+    fn remove_verified_owner_record(&mut self) -> Result<(), String> {
+        ownership::remove_owner_file(Path::new(PIDFILE), self.owner_file)
+    }
+}
+
+fn pidfd_exited(fd: libc::c_int) -> Result<bool, String> {
+    let mut descriptor = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+    if result < 0 {
+        return Err(format!(
+            "cannot inspect managed Mihomo pidfd: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(result > 0 && descriptor.revents & (libc::POLLIN | libc::POLLHUP) != 0)
+}
+
+fn send_pidfd_signal(fd: libc::c_int, signal: libc::c_int) -> Result<(), String> {
+    #[cfg(target_os = "linux")]
+    {
+        let result = unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                fd,
+                signal,
+                std::ptr::null::<libc::siginfo_t>(),
+                0,
+            )
+        };
+        if result == 0 {
+            return Ok(());
+        }
+        return Err(format!(
+            "could not signal verified Mihomo pidfd: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (fd, signal);
+        Err("safe managed Mihomo signaling requires Linux pidfd support".into())
     }
 }
 
@@ -986,6 +1263,23 @@ pub fn address_ready(ip: &str) -> bool {
     std::net::TcpListener::bind((ip, 0)).is_ok()
 }
 
+/// Fail before writing a candidate config when its client-facing listener is
+/// already owned by another service. This is a read-only bind probe; start
+/// still relies on Mihomo's actual bind result to close the race.
+pub fn preflight_proxy_port(ip: &str, port: u16) -> Result<(), String> {
+    let address = ip
+        .parse::<std::net::Ipv4Addr>()
+        .map_err(|_| "managed Mihomo listener address is not IPv4".to_string())?;
+    if port == 0 {
+        return Err("managed Mihomo listener port must be nonzero".into());
+    }
+    std::net::TcpListener::bind((address, port))
+        .map(drop)
+        .map_err(|error| {
+            format!("managed Mihomo listener {address}:{port} is unavailable: {error}")
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1011,6 +1305,27 @@ mod tests {
         fs::set_permissions(&state_file, fs::Permissions::from_mode(0o600)).unwrap();
         assert!(validate_managed_tree(&root, &mihomo_dir, &state_file).is_ok());
 
+        let managed_log = mihomo_dir.join("mihomo.log");
+        fs::write(&managed_log, b"log\n").unwrap();
+        fs::set_permissions(&managed_log, fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(validate_optional_private_file(&managed_log).is_ok());
+        fs::set_permissions(&managed_log, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(validate_optional_private_file(&managed_log).is_err());
+        fs::remove_file(&managed_log).unwrap();
+        let linked_log = mihomo_dir.join("linked.log");
+        std::os::unix::fs::symlink(&managed_log, &linked_log).unwrap();
+        assert!(validate_optional_private_file(&linked_log).is_err());
+        fs::remove_file(&linked_log).unwrap();
+
+        let profiles = mihomo_dir.join("profiles");
+        fs::create_dir(&profiles).unwrap();
+        fs::set_permissions(&profiles, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(validate_optional_private_directory(&profiles).is_ok());
+        fs::remove_dir(&profiles).unwrap();
+        std::os::unix::fs::symlink(&mihomo_dir, &profiles).unwrap();
+        assert!(validate_optional_private_directory(&profiles).is_err());
+        fs::remove_file(&profiles).unwrap();
+
         fs::set_permissions(&state_file, fs::Permissions::from_mode(0o644)).unwrap();
         assert!(validate_managed_tree(&root, &mihomo_dir, &state_file).is_err());
         fs::set_permissions(&state_file, fs::Permissions::from_mode(0o600)).unwrap();
@@ -1028,22 +1343,50 @@ mod tests {
     }
 
     #[test]
-    fn pid_record_cleanup_requires_matching_file_identity_and_pid() {
-        let root = std::env::temp_dir().join(format!("u60-pid-record-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(&root).unwrap();
-        let path = root.join("mihomo.pid");
-        let replacement = root.join("replacement.pid");
-        fs::write(&path, "123\n").unwrap();
-        let old_identity = file_identity(&fs::metadata(&path).unwrap());
-        fs::write(&replacement, "456\n").unwrap();
-        fs::rename(&replacement, &path).unwrap();
-        remove_pid_record(path.to_str().unwrap(), 123, old_identity);
-        assert_eq!(fs::read_to_string(&path).unwrap(), "456\n");
+    fn proxy_listener_preflight_detects_existing_port_owner() {
+        let listener = std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        assert!(preflight_proxy_port("127.0.0.1", port).is_err());
+        drop(listener);
+        assert!(preflight_proxy_port("127.0.0.1", port).is_ok());
+        assert!(preflight_proxy_port("not-an-ip", port).is_err());
+        assert!(preflight_proxy_port("127.0.0.1", 0).is_err());
+    }
 
-        let identity = file_identity(&fs::metadata(&path).unwrap());
-        remove_pid_record(path.to_str().unwrap(), 456, identity);
-        assert!(!path.exists());
+    #[test]
+    fn lifecycle_lock_serializes_concurrent_manager_instances_and_releases_on_drop() {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let root = std::env::temp_dir().join(format!(
+            "u60-manager-lock-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ));
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = root.join("manager.lock");
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(3));
+        let mut attempts = Vec::new();
+        for _ in 0..2 {
+            let barrier = std::sync::Arc::clone(&barrier);
+            let path = path.clone();
+            attempts.push(std::thread::spawn(move || {
+                barrier.wait();
+                let lock = acquire_lock_at(&path);
+                let acquired = lock.is_ok();
+                barrier.wait();
+                drop(lock);
+                acquired
+            }));
+        }
+        barrier.wait();
+        barrier.wait();
+        let acquired = attempts
+            .into_iter()
+            .map(|attempt| attempt.join().unwrap())
+            .filter(|acquired| *acquired)
+            .count();
+        assert_eq!(acquired, 1);
+        assert!(acquire_lock_at(&path).is_ok());
         let _ = fs::remove_dir_all(root);
     }
 

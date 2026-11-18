@@ -518,6 +518,7 @@ export interface ProxyStatus {
   installed: boolean
   version?: string
   running: boolean
+  lifecycle?: 'running' | 'stopped' | 'recovering' | 'blocked'
   pid?: number
   uptime_secs?: number
   rss_bytes?: number

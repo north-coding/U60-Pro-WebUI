@@ -934,6 +934,9 @@ export function mapTtlStatus(d: Record<string, unknown>): TtlStatus {
 // ── API surface ───────────────────────────────────────────────────────────────
 
 export const api = {
+  proxyCapabilities: () => req('GET', '/api/proxy/capabilities', undefined, undefined, 3_000, undefined, false),
+  proxyAgentStop: (preserve_mihomo: boolean) =>
+    req('POST', '/api/proxy/agent/stop', { preserve_mihomo }, { 'X-Confirm': 'true' }, 10_000),
   // Home — single batched request
   home: () => get('/api/dashboard').then(mapHome),
 
