@@ -1,11 +1,17 @@
 import { lazy, useEffect, useState } from 'react'
-import { AUTH_EXPIRED_EVENT, clearToken, hasToken } from './data/client'
+import { AUTH_EXPIRED_EVENT, ApiError, clearToken, hasToken } from './data/client'
 import { api } from './data/api'
 import { clearPollCache } from './data/poll'
 import { HomeProvider } from './app/HomeContext'
 import Login from './app/Login'
 import Shell, { type Group } from './app/Shell'
-import { agentModeFromCapabilities, secureManagementContext, type AgentMode } from './app/agentMode'
+import {
+  agentModeFromCapabilities,
+  isLegacyFullAgentProbe,
+  maySubmitCredentials,
+  secureManagementContext,
+  type AgentMode,
+} from './app/agentMode'
 import { useTheme } from './app/theme'
 import { ConfirmHost, Toaster } from './ui/feedback'
 import { Mark } from './ui/Mark'
@@ -21,18 +27,14 @@ const SystemGroup = lazy(() => import('./features/system/SystemGroup'))
 
 export default function App() {
   const secureContext = secureManagementContext(window.location)
-  const [authed, setAuthed] = useState(() => secureContext && hasToken())
+  const [authed, setAuthed] = useState(false)
   const [group, setGroup] = useState<Group>('home')
-  const [mode, setMode] = useState<AgentMode | 'checking' | 'insecure' | 'unavailable'>(secureContext ? 'checking' : 'insecure')
+  const [mode, setMode] = useState<AgentMode | 'checking' | 'insecure' | 'unavailable'>('checking')
   const [connectionError, setConnectionError] = useState('')
   const { theme, toggle } = useTheme()
 
   useEffect(() => {
     let active = true
-    if (!secureContext) {
-      clearToken()
-      return () => { active = false }
-    }
     api.proxyCapabilities().then((capabilities) => {
       if (!active) return
       const agentMode = agentModeFromCapabilities(capabilities)
@@ -42,9 +44,21 @@ export default function App() {
         return
       }
       if (agentMode === 'proxy_only') setGroup('proxy')
+      if (!maySubmitCredentials(agentMode, secureContext)) {
+        clearToken()
+        setAuthed(false)
+        setMode('insecure')
+        return
+      }
+      setAuthed(hasToken())
       setMode(agentMode)
     }).catch((error: unknown) => {
       if (!active) return
+      if (isLegacyFullAgentProbe(error instanceof ApiError ? error.status : undefined)) {
+        setAuthed(hasToken())
+        setMode('full')
+        return
+      }
       setConnectionError(error instanceof Error ? error.message : t('Could not reach the Agent.'))
       setMode('unavailable')
     })

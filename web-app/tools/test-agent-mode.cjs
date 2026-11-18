@@ -21,3 +21,16 @@ test('capability probe accepts only authenticated proxy-management modes', () =>
   assert.equal(mode.agentModeFromCapabilities({ mode: 'proxy_only', auth_required: true, features: ['router_management'] }), undefined)
   assert.equal(mode.agentModeFromCapabilities({ mode: 'unknown', auth_required: true, features: ['proxy_management'] }), undefined)
 })
+
+test('insecure HTTP blocks credentials only for proxy-only mode', () => {
+  assert.equal(mode.maySubmitCredentials('proxy_only', false), false)
+  assert.equal(mode.maySubmitCredentials('proxy_only', true), true)
+  assert.equal(mode.maySubmitCredentials('full', false), true)
+  assert.equal(mode.maySubmitCredentials('full', true), true)
+})
+
+test('only an unauthenticated 401 identifies a legacy full Agent', () => {
+  assert.equal(mode.isLegacyFullAgentProbe(401), true)
+  assert.equal(mode.isLegacyFullAgentProbe(404), false)
+  assert.equal(mode.isLegacyFullAgentProbe(undefined), false)
+})

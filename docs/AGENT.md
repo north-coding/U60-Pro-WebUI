@@ -55,6 +55,18 @@ is a route below — `scripts/check-api-contract.py` enforces both directions
 - **Dependencies**: `serde`, `serde_json`, `tiny_http`, `sha2`, `libc`. No TLS
   stack and no HTTP client — removing the DoH proxy, SMS forwarder and speed
   test dropped `ureq`, and with it rustls/ring/ICU.
+
+### Dashboard compatibility boundary
+
+The dashboard probes `GET /api/proxy/capabilities` without sending a session
+token before it mounts management pages. The proxy-only Agent reports that
+capability publicly; on a remote plain-HTTP page the dashboard clears any old
+token and blocks password entry for proxy-only mode. The existing full Agent's
+legacy HTTP behavior remains available for compatibility. An older full Agent
+that returns 401 for the unauthenticated capability probe is treated as full;
+an unreachable or otherwise unknown Agent stays unavailable. This preserves
+legacy operation, but full-mode HTTP credentials remain a legacy transport
+risk until that API is retired or served through HTTPS.
 - **Subprocess cost**: every `ubus`/`uci` read is a fork+exec, which dominates
   the agent's CPU (about 4–5 ms per `ubus call` on-device). `cache.rs` gives
   each dashboard source its own TTL (signal 1 s, WAN throughput 1 s, thermal 10 s, wan/wan6 30 s, data usage 30 s, cycle dates 300 s), so

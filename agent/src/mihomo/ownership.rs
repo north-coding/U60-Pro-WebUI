@@ -81,6 +81,33 @@ pub struct BinaryIdentity {
     pub sha256: String,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BinarySnapshot {
+    device: u64,
+    inode: u64,
+    size: u64,
+    uid: u32,
+    mode: u32,
+    links: u64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+impl BinarySnapshot {
+    fn from_metadata(metadata: &fs::Metadata) -> Self {
+        Self {
+            device: metadata.dev(),
+            inode: metadata.ino(),
+            size: metadata.len(),
+            uid: metadata.uid(),
+            mode: metadata.mode(),
+            links: metadata.nlink(),
+            modified: (metadata.mtime(), metadata.mtime_nsec()),
+            changed: (metadata.ctime(), metadata.ctime_nsec()),
+        }
+    }
+}
+
 pub fn validate_binary(path: &Path) -> Result<BinaryIdentity, String> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| format!("managed Mihomo binary is unavailable: {error}"))?;
@@ -95,12 +122,13 @@ pub fn validate_binary(path: &Path) -> Result<BinaryIdentity, String> {
     let opened = file
         .metadata()
         .map_err(|error| format!("cannot inspect managed Mihomo binary: {error}"))?;
+    let initial = BinarySnapshot::from_metadata(&opened);
     if metadata.file_type().is_symlink()
         || !opened.is_file()
         || opened.uid() != unsafe { libc::geteuid() }
         || opened.nlink() != 1
         || opened.mode() & 0o111 == 0
-        || FileIdentity::from_metadata(&metadata) != FileIdentity::from_metadata(&opened)
+        || BinarySnapshot::from_metadata(&metadata) != initial
     {
         return Err("managed Mihomo binary has unexpected type, owner, links, or mode".into());
     }
@@ -122,7 +150,12 @@ pub fn validate_binary(path: &Path) -> Result<BinaryIdentity, String> {
         return Err("managed Mihomo binary must be a 64-bit AArch64 ELF executable".into());
     }
 
+    // The header was read for validation, but it remains part of the binary's
+    // identity. Hash those exact bytes before continuing from the current fd
+    // offset so the digest covers the executable from byte zero to EOF.
     let mut hasher = Sha256::new();
+    hasher.update(elf_header);
+    let mut total_bytes = elf_header.len() as u64;
     let mut buffer = [0u8; 64 * 1024];
     loop {
         let count = file
@@ -132,12 +165,37 @@ pub fn validate_binary(path: &Path) -> Result<BinaryIdentity, String> {
             break;
         }
         hasher.update(&buffer[..count]);
+        total_bytes = total_bytes.saturating_add(count as u64);
     }
+    if total_bytes != initial.size {
+        return Err("managed Mihomo binary size changed while it was being hashed".into());
+    }
+    verify_binary_unchanged(path, &file, initial)?;
     Ok(BinaryIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
+        device: initial.device,
+        inode: initial.inode,
         sha256: format!("{:x}", hasher.finalize()),
     })
+}
+
+fn verify_binary_unchanged(
+    path: &Path,
+    file: &File,
+    initial: BinarySnapshot,
+) -> Result<(), String> {
+    let opened = file
+        .metadata()
+        .map_err(|error| format!("cannot recheck managed Mihomo binary: {error}"))?;
+    let current_path = fs::symlink_metadata(path)
+        .map_err(|error| format!("cannot recheck managed Mihomo binary path: {error}"))?;
+    if current_path.file_type().is_symlink()
+        || !current_path.is_file()
+        || BinarySnapshot::from_metadata(&opened) != initial
+        || BinarySnapshot::from_metadata(&current_path) != initial
+    {
+        return Err("managed Mihomo binary changed while its identity was being checked".into());
+    }
+    Ok(())
 }
 
 pub fn starting_record(
@@ -537,6 +595,7 @@ pub fn remove_owner_file(path: &Path, identity: FileIdentity) -> Result<(), Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::io::{Seek, SeekFrom};
     use std::os::unix::fs::{symlink, PermissionsExt};
     use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -595,6 +654,75 @@ mod tests {
         let link = root.join("link");
         symlink(&binary, &link).unwrap();
         assert!(validate_binary(&link).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn binary_sha256_covers_the_whole_file_including_valid_elf_header_bytes() {
+        let root = scratch("full-binary-hash");
+        let binary = root.join("mihomo");
+        fake_binary(&binary, 183);
+
+        let original = fs::read(&binary).unwrap();
+        let identity = validate_binary(&binary).unwrap();
+        assert_eq!(
+            identity.sha256,
+            format!("{:x}", Sha256::digest(&original)),
+            "digest must equal an independent whole-file SHA-256 calculation"
+        );
+
+        let mut changed_header = original;
+        changed_header[7] = 3; // A valid ELF OSABI value; architecture stays AArch64.
+        fs::write(&binary, &changed_header).unwrap();
+        let changed = validate_binary(&binary).unwrap();
+        assert_ne!(identity.sha256, changed.sha256);
+        assert_eq!(
+            changed.sha256,
+            format!("{:x}", Sha256::digest(&changed_header))
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn binary_validation_rejects_malformed_elf_headers_and_wrong_architecture() {
+        let root = scratch("malformed-binary");
+        let binary = root.join("mihomo");
+        fake_binary(&binary, 62);
+        assert!(validate_binary(&binary).is_err());
+
+        fs::write(&binary, b"not an ELF executable with a long enough header").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(validate_binary(&binary).is_err());
+
+        fs::write(&binary, b"\x7fELF\x02\x01\x01").unwrap();
+        fs::set_permissions(&binary, fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(validate_binary(&binary).is_err());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn binary_validation_rechecks_open_file_metadata_and_current_path() {
+        let root = scratch("changed-binary");
+        let binary = root.join("mihomo");
+        fake_binary(&binary, 183);
+
+        let file = OpenOptions::new().read(true).open(&binary).unwrap();
+        let before = BinarySnapshot::from_metadata(&file.metadata().unwrap());
+        let mut writer = OpenOptions::new().write(true).open(&binary).unwrap();
+        writer.seek(SeekFrom::Start(40)).unwrap();
+        writer.write_all(&[1]).unwrap();
+        writer.sync_all().unwrap();
+        assert!(verify_binary_unchanged(&binary, &file, before).is_err());
+
+        drop(writer);
+        drop(file);
+        fake_binary(&binary, 183);
+        let file = OpenOptions::new().read(true).open(&binary).unwrap();
+        let before = BinarySnapshot::from_metadata(&file.metadata().unwrap());
+        let replacement = root.join("replacement");
+        fake_binary(&replacement, 183);
+        fs::rename(&replacement, &binary).unwrap();
+        assert!(verify_binary_unchanged(&binary, &file, before).is_err());
         let _ = fs::remove_dir_all(root);
     }
 

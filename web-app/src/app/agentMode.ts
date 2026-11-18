@@ -23,3 +23,16 @@ export function agentModeFromCapabilities(value: Record<string, unknown>): Agent
   }
   return value.mode === 'proxy_only' || value.mode === 'full' ? value.mode : undefined
 }
+
+// The secure-context gate applies to the new proxy-only Agent. Keep the
+// existing full Agent's HTTP behavior intact until that legacy API is retired.
+export function maySubmitCredentials(mode: AgentMode, secureContext: boolean): boolean {
+  return mode === 'full' || secureContext
+}
+
+// Older full Agents authenticate before route dispatch, so an unauthenticated
+// capability probe receives 401 when that endpoint did not exist yet. The
+// proxy-only Agent always exposes its mode probe publicly.
+export function isLegacyFullAgentProbe(status: number | undefined): boolean {
+  return status === 401
+}
