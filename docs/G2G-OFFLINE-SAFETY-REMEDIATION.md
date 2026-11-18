@@ -19,16 +19,23 @@ original startup file at
 group, mode, device, inode, length, and SHA-256 metadata before replacing the
 entry. All non-entry bytes and line endings are preserved.
 
-The bounded health contract is at most eight seconds total, with each
-loopback HTTP request bounded to one second and at most eight attempts. It
-checks proxy-only capabilities, logs in with the private credential, then
-checks proxy status using the returned Bearer token. Failure or interruption
-removes only the exact new startup entry. It retains the complete original
-snapshot and deliberately does not put the abandoned legacy startup command
-back into the boot file. The transaction does not stop processes, delete
-routes or firewall rules, remove interfaces, or clean legacy Mihomo files.
-If the exact rollback cannot be verified, it leaves the candidate and
-protected snapshot in place and reports recovery as blocked.
+The bounded synthetic health exchange is at most eight seconds total, with
+each loopback HTTP request bounded to one second and at most eight attempts.
+It checks proxy-only capabilities, logs in with the test-root credential, then
+checks proxy status using the returned Bearer token. The probe refuses any
+password path outside the marked temporary tree. It is not a device-ready
+health adapter: before a future device adapter may send the production
+credential over TCP, it must positively verify the listener's executable and
+process identity first (for example through a peer-credential-checked Unix
+socket). That check depends on the separately authorized read-only process
+inventory below.
+
+Failure or interruption removes only the exact new startup entry. It retains
+the complete original snapshot and deliberately does not put the abandoned
+legacy startup command back into the boot file. The transaction does not stop
+processes, delete routes or firewall rules, remove interfaces, or clean legacy
+Mihomo files. If the exact rollback cannot be verified, it leaves the
+candidate and protected snapshot in place and reports recovery as blocked.
 
 The synthetic test suite covers successful activation, health and launch
 failure, interruption before and after replacement, malformed or mismatched

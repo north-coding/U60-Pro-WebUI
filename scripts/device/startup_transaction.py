@@ -619,12 +619,20 @@ def wait_authenticated_health(
     return False
 
 
-class LocalAgentHealthProbe:
-    """Authenticated loopback-only probe; every HTTP request honors the deadline."""
+class SyntheticLocalAgentHealthProbe:
+    """Synthetic authenticated probe; it cannot read a device credential."""
 
-    def __init__(self, password_path: Path, port: int = 9090):
+    def __init__(self, password_path: Path, test_root: Path, port: int = 9090):
         if port < 1 or port > 65535:
             raise ValueError("health probe port is invalid")
+        root = validate_synthetic_test_root(test_root)
+        expected_password_path = root / MANAGED_ROOT / "auth/password"
+        try:
+            resolved_password_path = password_path.resolve(strict=True)
+        except OSError as error:
+            raise ValueError("synthetic health probe credential is unavailable") from error
+        if resolved_password_path != expected_password_path:
+            raise ValueError("synthetic health probe requires the marked test-root credential path")
         self.password = read_password_file(password_path)
         self.port = port
 

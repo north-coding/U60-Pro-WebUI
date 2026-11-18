@@ -114,6 +114,7 @@ class SingleMihomoCutoverValidator(unittest.TestCase):
         self.assertFalse(transaction["device_execution_enabled"])
         self.assertEqual(transaction["execution_mode"], "marked_temporary_synthetic_root_only")
         self.assertIn("never restore the abandoned legacy startup entry", transaction["rollback_policy"])
+        self.assertIn("verify listener executable and process identity", transaction["health_check"]["device_gate"])
         self.assertFalse(MANIFEST["management_transport"]["forwarded_client_address_headers_trusted"])
         self.assertIn("deployment_blocker", MANIFEST["management_transport"]["source_aware_login_throttling"])
 

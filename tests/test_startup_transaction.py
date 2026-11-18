@@ -348,7 +348,7 @@ class AuthenticatedHealthProbeTests(StartupFixture):
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            probe = startup.LocalAgentHealthProbe(self.password_file, server.server_port)
+            probe = startup.SyntheticLocalAgentHealthProbe(self.password_file, self.root, server.server_port)
             self.assertTrue(probe(time.monotonic() + 2))
         finally:
             server.shutdown()
@@ -363,11 +363,16 @@ class AuthenticatedHealthProbeTests(StartupFixture):
     def test_probe_rejects_missing_or_malformed_credentials_before_network(self):
         missing = self.auth_dir / "missing"
         with self.assertRaises(ValueError):
-            startup.LocalAgentHealthProbe(missing, 9090)
+            startup.SyntheticLocalAgentHealthProbe(missing, self.root, 9090)
+        other = self.auth_dir / "other"
+        other.write_text(PASSWORD + "\n")
+        other.chmod(0o600)
+        with self.assertRaisesRegex(ValueError, "test-root credential path"):
+            startup.SyntheticLocalAgentHealthProbe(other, self.root, 9090)
         self.password_file.write_text("weak\n")
         self.password_file.chmod(0o600)
         with self.assertRaises(ValueError):
-            startup.LocalAgentHealthProbe(self.password_file, 9090)
+            startup.SyntheticLocalAgentHealthProbe(self.password_file, self.root, 9090)
 
     def test_nonresponsive_loopback_endpoint_is_cancelled_at_request_deadline(self):
         hits = []
@@ -396,7 +401,7 @@ class AuthenticatedHealthProbeTests(StartupFixture):
         thread.start()
         started = time.monotonic()
         try:
-            probe = startup.LocalAgentHealthProbe(self.password_file, server.server_port)
+            probe = startup.SyntheticLocalAgentHealthProbe(self.password_file, self.root, server.server_port)
             healthy = startup.wait_authenticated_health(
                 probe,
                 total_timeout=0.12,

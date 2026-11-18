@@ -129,7 +129,7 @@
     "snapshot_integrity": "sha256 plus original owner, group, mode, device and inode metadata",
     "candidate_entry": "sh /data/u60-pro-managed/agent/start-proxy-agent.sh start",
     "replace_policy": "replace only one exact unchanged project-owned old Agent entry; preserve all other bytes",
-    "health_check": {"auth": "loopback capability discovery, password login, bearer-authenticated proxy status", "total_timeout_seconds": 8, "per_request_timeout_seconds": 1, "attempts": 8},
+    "health_check": {"scope": "marked_temporary_synthetic_root_only", "auth": "synthetic loopback capability discovery, test-password login, bearer-authenticated proxy status", "total_timeout_seconds": 8, "per_request_timeout_seconds": 1, "attempts": 8, "device_gate": "verify listener executable and process identity before any production credential is sent; no device health adapter is implemented"},
     "rollback_policy": "remove only the exact new proxy-only startup entry; retain the original snapshot; never restore the abandoned legacy startup entry",
     "process_and_network_cleanup": "none; do not stop unverified processes or delete routes, firewall rules, interfaces, or legacy Mihomo files"
   },
