@@ -8,6 +8,7 @@ const http = require('node:http')
 const https = require('node:https')
 const vm = require('node:vm')
 const ts = require('typescript')
+const { loadTs } = require('./ts-loader.cjs')
 
 const i18nStub = {
   t: (text, vars) => (vars ? text.replace(/\{(\w+)\}/g, (match, key) => (key in vars ? String(vars[key]) : match)) : text),
@@ -27,9 +28,9 @@ function close(server) {
   return new Promise(resolve => server.close(() => resolve()))
 }
 
-function httpsRequest(url, { method = 'GET', headers = {}, body, ca } = {}) {
+function httpsRequest(url, { method = 'GET', headers = {}, body, ca, signal } = {}) {
   return new Promise((resolve, reject) => {
-    const request = https.request(url, { method, headers, ca }, response => {
+    const request = https.request(url, { method, headers, ca, signal }, response => {
       const chunks = []
       response.on('data', chunk => chunks.push(chunk))
       response.on('end', () => resolve({
@@ -43,6 +44,32 @@ function httpsRequest(url, { method = 'GET', headers = {}, body, ca } = {}) {
     if (body !== undefined) request.write(body)
     request.end()
   })
+}
+
+function loadManagementApi(location, fetchImpl) {
+  const previous = {
+    window: globalThis.window,
+    sessionStorage: globalThis.sessionStorage,
+    fetch: globalThis.fetch,
+  }
+  globalThis.window = { location, dispatchEvent: () => {} }
+  globalThis.sessionStorage = { getItem: () => null, setItem: () => {}, removeItem: () => {} }
+  globalThis.fetch = fetchImpl
+  const client = loadTs('data/client.ts', { stubs: { i18n: i18nStub } })
+  const api = loadTs('data/api.ts', { stubs: { client, i18n: i18nStub } }).api
+  const flow = loadTs('features/proxy/subscriptionFlow.ts')
+  return {
+    client,
+    api,
+    flow,
+    restore() {
+      if (previous.window === undefined) delete globalThis.window
+      else globalThis.window = previous.window
+      if (previous.sessionStorage === undefined) delete globalThis.sessionStorage
+      else globalThis.sessionStorage = previous.sessionStorage
+      globalThis.fetch = previous.fetch
+    },
+  }
 }
 
 function loadClient(location, fetchImpl) {
@@ -64,7 +91,7 @@ function loadClient(location, fetchImpl) {
   return context.exports
 }
 
-test('same-origin HTTPS WebUI proxy keeps credentials on TLS and forwards only allowed management APIs', async t => {
+test('synthetic same-origin HTTPS gateway keeps credentials on TLS and forwards allowed proxy APIs', async t => {
   const temp = fs.mkdtempSync(path.join(os.tmpdir(), 'u60-secure-origin-'))
   fs.chmodSync(temp, 0o700)
   const keyFile = path.join(temp, 'ephemeral-test-key.pem')
@@ -81,6 +108,10 @@ test('same-origin HTTPS WebUI proxy keeps credentials on TLS and forwards only a
   const expectedPassword = 'synthetic-password-only'
   const expectedToken = 'synthetic-bearer-only'
   const trustedOrigin = { value: '' }
+  let refreshData = { results: {
+    'synthetic-id': { ok: true },
+    'synthetic-second': { ok: true },
+  } }
 
   const agent = http.createServer((request, response) => {
     const chunks = []
@@ -111,7 +142,10 @@ test('same-origin HTTPS WebUI proxy keeps credentials on TLS and forwards only a
         if (request.headers.authorization !== `Bearer ${expectedToken}`) {
           response.writeHead(401).end(JSON.stringify({ ok: false, error: 'unauthorized' }))
         } else {
-          response.end(JSON.stringify({ ok: true, data: [{ id: 'synthetic-id', name: 'synthetic-provider', enabled: true }] }))
+          response.end(JSON.stringify({ ok: true, data: { running: true, subscriptions: [
+            { id: 'synthetic-id', name: 'synthetic-provider', enabled: true, use_config: false, interval_hours: 24 },
+            { id: 'synthetic-second', name: 'synthetic-second-provider', enabled: true, use_config: false, interval_hours: 24 },
+          ] } }))
         }
       } else if (request.url === '/api/proxy/subscriptions' && request.method === 'POST') {
         if (request.headers.authorization !== `Bearer ${expectedToken}`) {
@@ -123,13 +157,18 @@ test('same-origin HTTPS WebUI proxy keeps credentials on TLS and forwards only a
         if (request.headers.authorization !== `Bearer ${expectedToken}`) {
           response.writeHead(401).end(JSON.stringify({ ok: false, error: 'unauthorized' }))
         } else {
-          response.end(JSON.stringify({ ok: true, data: { 'synthetic-id': { ok: true, updated: 1 } } }))
+          response.end(JSON.stringify({ ok: true, data: refreshData }))
         }
       } else if (request.url === '/api/proxy/groups' && request.method === 'GET') {
         if (request.headers.authorization !== `Bearer ${expectedToken}`) {
           response.writeHead(401).end(JSON.stringify({ ok: false, error: 'unauthorized' }))
         } else {
-          response.end(JSON.stringify({ ok: true, data: { mode: 'rule', groups: [{ name: 'PROXY', now: 'synthetic-node' }] } }))
+          response.end(JSON.stringify({ ok: true, data: {
+            running: true,
+            groups: [{ name: 'PROXY', type: 'Selector', now: 'synthetic-node', all: ['synthetic-node'], hidden: false }],
+            nodes: [{ name: 'synthetic-node', type: 'Shadowsocks', udp: true, alive: true, delay: 20,
+              subscription_id: 'synthetic-id', subscription: 'synthetic-provider' }],
+          } }))
         }
       } else if (request.url === '/api/proxy/groups' && request.method === 'PUT') {
         if (request.headers.authorization !== `Bearer ${expectedToken}`) {
@@ -194,7 +233,7 @@ test('same-origin HTTPS WebUI proxy keeps credentials on TLS and forwards only a
     const fetchImpl = async (url, options) => {
       webRequests.push({ url, options })
       const headers = { ...options.headers, Origin: origin }
-      const result = await httpsRequest(url, { method: options.method, headers, body: options.body, ca })
+      const result = await httpsRequest(url, { method: options.method, headers, body: options.body, ca, signal: options.signal })
       return {
         ok: result.status >= 200 && result.status < 300,
         status: result.status,
@@ -206,22 +245,85 @@ test('same-origin HTTPS WebUI proxy keeps credentials on TLS and forwards only a
 
     const capabilities = await client.req('GET', '/api/proxy/capabilities', undefined, undefined, 15000, client.API_BASE, false)
     assert.equal(capabilities.mode, 'proxy_only')
-    const login = await client.login(expectedPassword)
+    const management = loadManagementApi(
+      { protocol: 'https:', hostname: '127.0.0.1', origin },
+      fetchImpl,
+    )
+    t.after(() => management.restore())
+    const login = await management.client.login(expectedPassword)
     assert.equal(login.token, expectedToken)
-    client.setToken(login.token)
-    const subscriptions = await client.get('/api/proxy/subscriptions')
-    const added = await client.post('/api/proxy/subscriptions', { name: 'synthetic-provider', url: 'https://provider.invalid/synthetic' })
-    const refreshed = await client.post('/api/proxy/subscriptions/update', { id: 'synthetic-id' })
-    const groups = await client.get('/api/proxy/groups')
-    const selected = await client.put('/api/proxy/groups', { group: 'PROXY', proxy: 'synthetic-node' })
-    const settings = await client.put('/api/proxy/settings', { mode: 'rule', preset: 'bypass_cn' })
-    assert.equal(subscriptions[0].name, 'synthetic-provider')
+    management.client.setToken(login.token)
+
+    // Exercise the actual API facade and its response mappers against Rust
+    // Agent-shaped synthetic envelopes through the HTTPS gateway.
+    const subscriptions = await management.api.proxySubscriptions()
+    const added = await management.api.proxySubscriptionAdd({
+      name: 'synthetic-provider', url: 'https://provider.invalid/synthetic', interval_hours: 24, use_config: false,
+    })
+    const groups = await management.api.proxyGroups()
+    const selected = await management.api.proxySelect('PROXY', 'synthetic-node')
+    const settings = await management.api.proxySettings({ mode: 'rule', preset: 'bypass_cn' })
+    assert.equal(subscriptions.running, true)
+    assert.equal(subscriptions.subscriptions[0].name, 'synthetic-provider')
+    assert.equal(subscriptions.subscriptions[0].use_config, false)
     assert.equal(added.id, 'synthetic-id')
-    assert.equal(refreshed['synthetic-id'].ok, true)
-    assert.equal(groups.mode, 'rule')
+    assert.equal(groups.running, true)
+    assert.equal(groups.groups[0].name, 'PROXY')
+    assert.equal(groups.nodes[0].name, 'synthetic-node')
     assert.equal(selected.now, 'synthetic-node')
     assert.equal(settings.preset, 'bypass_cn')
-    assert.ok(webRequests.length >= 7)
+
+    const expectedIds = subscriptions.subscriptions.map(subscription => subscription.id)
+    const runUpdate = () => management.flow.runSubscriptionUpdateFlow({
+      running: true,
+      expectedIds,
+      confirmStart: async () => { throw new Error('already running; confirmation is not expected') },
+      start: async () => { throw new Error('already running; start is not expected') },
+      waitUntilReady: async () => (await management.api.proxyGroups()).running,
+      refresh: () => management.api.proxySubscriptionUpdate(),
+    })
+
+    const successful = await runUpdate()
+    assert.equal(successful.status, 'updated')
+    assert.equal(successful.summary.successCount, 2)
+    assert.equal(successful.summary.failureCount, 0)
+
+    refreshData = { results: {
+      'synthetic-id': { ok: true },
+      'synthetic-second': { ok: false, error: 'synthetic provider unavailable' },
+    } }
+    const partial = await runUpdate()
+    assert.equal(partial.status, 'updated')
+    assert.equal(partial.summary.successCount, 1)
+    assert.equal(partial.summary.failureCount, 1)
+    assert.equal(partial.summary.results['synthetic-second'].error, 'synthetic provider unavailable')
+
+    refreshData = { results: {
+      'synthetic-id': { ok: 'true' },
+      'synthetic-second': { ok: true },
+    } }
+    const malformed = await runUpdate()
+    assert.equal(malformed.status, 'updated')
+    assert.equal(malformed.summary.malformed, true)
+    assert.equal(malformed.summary.successCount, 1)
+    assert.equal(malformed.summary.failureCount, 1)
+    assert.equal(malformed.summary.results['synthetic-id'].ok, false)
+
+    refreshData = { results: ['not-a-provider-result-map'] }
+    const malformedResponse = await runUpdate()
+    assert.equal(malformedResponse.status, 'updated')
+    assert.equal(malformedResponse.summary.malformed, true)
+    assert.equal(malformedResponse.summary.successCount, 0)
+    assert.equal(malformedResponse.summary.failureCount, 2)
+
+    refreshData = { results: { 'synthetic-id': { ok: true } } }
+    const missingProvider = await runUpdate()
+    assert.equal(missingProvider.status, 'updated')
+    assert.equal(missingProvider.summary.malformed, true)
+    assert.equal(missingProvider.summary.successCount, 0)
+    assert.equal(missingProvider.summary.failureCount, 2)
+    assert.ok(webRequests.some(item => item.url.endsWith('/api/proxy/subscriptions/update')))
+    assert.ok(webRequests.length >= 12)
     assert.ok(webRequests.every(item => new URL(item.url).origin === origin))
     assert.ok(webRequests.every(item => !item.url.startsWith('http://')))
     const loginRequest = webRequests.find(item => item.url.endsWith('/api/auth/login'))

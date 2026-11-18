@@ -33,12 +33,16 @@ not add trust in caller-supplied forwarding headers.
 
 The local HTTPS integration test generates an ephemeral test certificate in
 a disposable temporary directory, serves a small synthetic UI, and forwards
-same-origin API requests to a synthetic loopback Agent. It checks login,
-Bearer-authenticated subscription/node/Rule calls, exact Origin handling,
-unauthorized requests, denial of router endpoints, and normal certificate
-verification failure. No private key or certificate is stored in the source
-tree. This tests the browser/API integration contract; it is not a packaged
-router TLS gateway.
+same-origin API requests to a synthetic loopback Agent. Rust Agent-shaped
+subscription, refresh, and group envelopes are consumed through the existing
+frontend API methods and response mappers; refresh outcomes also pass through
+the production per-provider result validator. The test covers successful and
+partial refreshes, malformed and missing provider results, exact Origin
+handling, unauthorized requests, denial of router endpoints, and normal
+certificate verification failure. No private key or certificate is stored in
+the source tree. This is a synthetic TLS transport and frontend API-contract
+test: it does not run the Rust Agent or a browser, and it does not prove
+device-side gateway, certificate, or deployment behavior.
 
 ## Existing router-facing evidence
 
