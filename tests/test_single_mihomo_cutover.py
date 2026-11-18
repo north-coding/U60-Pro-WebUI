@@ -109,6 +109,14 @@ class SingleMihomoCutoverValidator(unittest.TestCase):
         self.assertTrue(all(a["requires_owner_review"] for a in result["candidate_actions"]))
         self.assertTrue(all(not a["execution_supported"] for a in result["candidate_actions"]))
 
+    def test_g2g_contract_is_synthetic_only_and_never_restores_legacy_startup(self):
+        transaction = MANIFEST["startup_activation_transaction"]
+        self.assertFalse(transaction["device_execution_enabled"])
+        self.assertEqual(transaction["execution_mode"], "marked_temporary_synthetic_root_only")
+        self.assertIn("never restore the abandoned legacy startup entry", transaction["rollback_policy"])
+        self.assertFalse(MANIFEST["management_transport"]["forwarded_client_address_headers_trusted"])
+        self.assertIn("deployment_blocker", MANIFEST["management_transport"]["source_aware_login_throttling"])
+
     def test_unknown_owner_blocks_all_candidates(self):
         state = synthetic_inventory()
         state["paths"][0]["classification"] = "unknown"
