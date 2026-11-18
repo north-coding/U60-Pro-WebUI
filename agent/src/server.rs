@@ -163,7 +163,10 @@ fn proxy_only_methods(path: &str) -> Option<&'static [&'static str]> {
     }
 }
 
-fn proxy_only_origin_allowed(origin: &str, bind: SocketAddr) -> bool {
+fn proxy_only_origin_allowed(origin: &str, bind: SocketAddr, https_origin: Option<&str>) -> bool {
+    if origin.starts_with("https://") {
+        return https_origin == Some(origin);
+    }
     let Some(authority) = origin.strip_prefix("http://") else {
         return false;
     };
@@ -223,7 +226,7 @@ fn handle_proxy_only_request(mut request: Request, state: &ProxyOnlyState, bind:
     let origin = proxy_only_request_header(&request, "Origin").map(str::to_string);
     let origin_ref = origin.as_deref();
     if let Some(origin) = origin_ref {
-        if !proxy_only_origin_allowed(origin, bind) {
+        if !proxy_only_origin_allowed(origin, bind, state.https_origin.as_deref()) {
             respond_proxy_only(
                 request,
                 403,
@@ -1115,6 +1118,10 @@ mod tests {
     }
 
     fn smoke_server() -> SmokeServer {
+        smoke_server_with_origin(None)
+    }
+
+    fn smoke_server_with_origin(https_origin: Option<&str>) -> SmokeServer {
         static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let root = std::env::temp_dir().join(format!(
             "u60-proxy-http-{}-{}",
@@ -1146,8 +1153,13 @@ mod tests {
         let bytes = serde_json::to_vec_pretty(&saved_state).unwrap();
         crate::storage::atomic_write(&state_file, &bytes).unwrap();
         let state = Arc::new(
-            ProxyOnlyState::new_for_test("synthetic-password", &root.join("auth/salt"), state_file)
-                .unwrap(),
+            ProxyOnlyState::new_for_test_with_origin(
+                "synthetic-password",
+                &root.join("auth/salt"),
+                state_file,
+                https_origin.map(str::to_string),
+            )
+            .unwrap(),
         );
         let server = Arc::new(Server::http("127.0.0.1:0").unwrap());
         let address = server.server_addr().to_ip().unwrap();
@@ -1408,19 +1420,23 @@ mod tests {
         let bind = "127.0.0.1:9090".parse().unwrap();
         assert!(super::proxy_only_origin_allowed(
             "http://localhost:5173",
-            bind
+            bind,
+            None
         ));
         assert!(super::proxy_only_origin_allowed(
             "http://127.0.0.1:8080",
-            bind
+            bind,
+            None
         ));
         assert!(!super::proxy_only_origin_allowed(
             "http://localhost:3000",
-            bind
+            bind,
+            None
         ));
         assert!(!super::proxy_only_origin_allowed(
             "http://127.0.0.2:5173",
-            bind
+            bind,
+            None
         ));
     }
 
@@ -1429,15 +1445,63 @@ mod tests {
         let bind = "192.168.0.1:9090".parse().unwrap();
         assert!(super::proxy_only_origin_allowed(
             "http://192.168.0.1:8080",
-            bind
+            bind,
+            None
         ));
         assert!(!super::proxy_only_origin_allowed(
             "http://192.168.0.1:9090",
-            bind
+            bind,
+            None
         ));
         assert!(!super::proxy_only_origin_allowed(
             "http://192.168.0.2:8080",
-            bind
+            bind,
+            None
         ));
+    }
+
+    #[test]
+    fn proxy_only_https_origin_requires_exact_explicit_configuration() {
+        let bind = "127.0.0.1:9090".parse().unwrap();
+        let allowed = "https://u60.home.arpa:8443";
+        assert!(super::proxy_only_origin_allowed(
+            allowed,
+            bind,
+            Some(allowed)
+        ));
+        for rejected in [
+            "https://u60.home.arpa",
+            "https://other.home.arpa:8443",
+            "https://u60.home.arpa:8443.evil.invalid",
+            "http://u60.home.arpa:8443",
+        ] {
+            assert!(!super::proxy_only_origin_allowed(
+                rejected,
+                bind,
+                Some(allowed)
+            ));
+        }
+        assert!(!super::proxy_only_origin_allowed(allowed, bind, None));
+
+        let server = smoke_server_with_origin(Some(allowed));
+        let (status, headers, _) = http(
+            server.address,
+            "GET",
+            "/api/proxy/capabilities",
+            &[("Origin", allowed)],
+            "",
+        );
+        assert_eq!(status, 200);
+        assert!(headers.contains(&format!("Access-Control-Allow-Origin: {allowed}")));
+
+        let (status, headers, _) = http(
+            server.address,
+            "GET",
+            "/api/proxy/capabilities",
+            &[("Origin", "https://attacker.invalid")],
+            "",
+        );
+        assert_eq!(status, 403);
+        assert!(!headers.contains("Access-Control-Allow-Origin"));
     }
 }

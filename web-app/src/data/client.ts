@@ -2,8 +2,12 @@
 
 import { t } from '../i18n'
 
-const apiProtocol = window.location.protocol === 'https:' ? 'https:' : 'http:'
-export const API_BASE = `${apiProtocol}//${window.location.hostname}:9090`
+// In the secure proxy-only deployment, the browser talks only to its current
+// HTTPS origin. That endpoint serves the SPA and reverse-proxies /api/* to the
+// loopback-only Agent. HTTP development/legacy deployments retain port 9090.
+export const API_BASE = window.location.protocol === 'https:'
+  ? window.location.origin
+  : `http://${window.location.hostname}:9090`
 export const AUTH_EXPIRED_EVENT = 'zte-auth-expired'
 
 let _token: string | null = sessionStorage.getItem('zte_token')
@@ -68,6 +72,9 @@ export async function req(
       if (error !== null && typeof error === 'object' && 'name' in error && error.name === 'AbortError') {
         throw new ApiError(t('Timed out reaching the agent'))
       }
+      if (window.location.protocol === 'https:' && base === API_BASE) {
+        throw new ApiError(t('Secure WebUI request failed; check the HTTPS gateway and trusted certificate at {address}', { address: API_BASE }))
+      }
       throw new ApiError(t('Failed to reach the agent at {address}', { address: API_BASE }))
     }
 
@@ -101,7 +108,7 @@ export async function login(
   credentials: string | { password?: string; pin?: string },
 ): Promise<{ token: string }> {
   const body = typeof credentials === 'string' ? { password: credentials } : credentials
-  const data = await req('POST', '/api/auth/login', body)
+  const data = await req('POST', '/api/auth/login', body, undefined, 15_000, API_BASE, false)
   return { token: data.token as string }
 }
 
@@ -109,6 +116,9 @@ export async function login(
 // a single-use confirmation token during a LAN transition. Never transfer the
 // general session token: the proposed address could already belong to another host.
 export async function confirmLan(ip: string, confirmationToken: string) {
+  if (window.location.protocol === 'https:') {
+    throw new ApiError(t('LAN confirmation cannot send a token over HTTP'))
+  }
   const octets = ip.split('.').map(Number)
   if (!/^\d{1,3}(\.\d{1,3}){3}$/.test(ip) || octets.some(n => n > 255) ||
       !(octets[0] === 10 || (octets[0] === 172 && octets[1] >= 16 && octets[1] <= 31) ||
@@ -122,9 +132,20 @@ export async function readCsv(path: string): Promise<{ csv: string }> {
   const controller = new AbortController()
   const timeout = setTimeout(() => controller.abort(), 30_000)
   try {
-    const response = await fetch(`${API_BASE}${path}`, {
-      headers: _token ? { Authorization: `Bearer ${_token}` } : {}, signal: controller.signal,
-    })
+    let response: Response
+    try {
+      response = await fetch(`${API_BASE}${path}`, {
+        headers: _token ? { Authorization: `Bearer ${_token}` } : {}, signal: controller.signal,
+      })
+    } catch (error) {
+      if (error !== null && typeof error === 'object' && 'name' in error && error.name === 'AbortError') {
+        throw new ApiError(t('Timed out reaching the agent'))
+      }
+      if (window.location.protocol === 'https:') {
+        throw new ApiError(t('Secure WebUI request failed; check the HTTPS gateway and trusted certificate at {address}', { address: API_BASE }))
+      }
+      throw error
+    }
     if (response.status === 401) emitAuthExpired()
     if (!response.ok) throw new ApiError(t('CSV download failed ({status})', { status: response.status }), response.status)
     // Older agents and the emulator return a JSON envelope.

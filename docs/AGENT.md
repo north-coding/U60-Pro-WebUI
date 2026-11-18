@@ -117,10 +117,15 @@ before the legacy Agent initializes. The managed launcher supplies
 requires the private, root-owned 0600 file and does not put the credential in
 its process environment. `ZTE_AGENT_PASSWORD` remains available only for
 manual development runs and is unset by the managed launcher. The default
-listener is `127.0.0.1:9090`. Non-loopback binding is rejected until an HTTPS
-management path is implemented and reviewed; the existing WebUI server on
-port 8080 and Agent API on port 9090 use plain HTTP. Unknown or conflicting
-arguments fail before startup.
+listener is `127.0.0.1:9090`. Non-loopback binding is always rejected. An
+optional `--proxy-https-origin https://HOST[:PORT]` allows exactly one HTTPS
+Origin from a same-origin TLS gateway which forwards `/api/*` to the loopback
+Agent. The Agent itself does not terminate TLS. The managed launcher reads
+the optional origin from the single-line, root-owned `0600` file
+`/data/u60-pro-managed/auth/webui-origin`; the file may be absent. HTTP Origins
+remain limited to local development on loopback. The existing WebUI on port
+8080 and Agent API on port 9090 use plain HTTP. Unknown, malformed or
+conflicting arguments fail before startup.
 
 This mode constructs only password authentication and the Mihomo manager. It
 does not run migration cleanup, EventBus, charge or SMS workers, traffic

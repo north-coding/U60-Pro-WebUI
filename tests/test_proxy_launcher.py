@@ -113,6 +113,46 @@ else:
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertIn("already running", second.stdout)
 
+    def test_https_origin_file_is_private_and_forwarded_as_an_exact_startup_argument(self):
+        capture = Path(self.temp.name) / "agent-env"
+        origin_file = self.root / "auth/webui-origin"
+        origin_file.write_text("https://u60.home.arpa:8443\n")
+        origin_file.chmod(0o600)
+        result = self._run("start", U60_PROXY_TEST_ENV_CAPTURE=str(capture))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            capture.read_text(),
+            f"{self.root}/auth/password||--proxy-only --proxy-bind 127.0.0.1:9090 --proxy-https-origin https://u60.home.arpa:8443",
+        )
+        origin_file.chmod(0o640)
+        self.down.touch()
+        invalid = self._run("start")
+        self.assertNotEqual(invalid.returncode, 0)
+        self.assertIn("mode 600", invalid.stderr)
+        origin_file.chmod(0o600)
+        origin_file.write_text("http://u60.home.arpa\n")
+        invalid_scheme = self._run("start")
+        self.assertNotEqual(invalid_scheme.returncode, 0)
+        self.assertIn("must start with https://", invalid_scheme.stderr)
+
+    def test_https_origin_file_rejects_multiple_lines(self):
+        origin_file = self.root / "auth/webui-origin"
+        origin_file.write_text("https://u60.home.arpa\nhttps://attacker.invalid\n")
+        origin_file.chmod(0o600)
+        result = self._run("start")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("exactly one line", result.stderr)
+
+    def test_https_origin_file_rejects_symbolic_links(self):
+        target = Path(self.temp.name) / "outside-origin"
+        target.write_text("https://u60.home.arpa\n")
+        target.chmod(0o600)
+        origin_file = self.root / "auth/webui-origin"
+        origin_file.symlink_to(target)
+        result = self._run("start")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("must not be a symbolic link", result.stderr)
+
     def test_restart_preserves_managed_mihomo_for_verified_recovery(self):
         self.down.unlink()
         result = self._run("restart")

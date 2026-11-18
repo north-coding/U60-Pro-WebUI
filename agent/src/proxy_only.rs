@@ -14,9 +14,10 @@ pub struct ProxyOnlyState {
     pub auth: AuthState,
     pub mihomo: Arc<Manager>,
     pub shutdown: Arc<AtomicBool>,
+    pub https_origin: Option<String>,
 }
 
-pub fn run(bind: SocketAddr) -> Result<(), String> {
+pub fn run(bind: SocketAddr, https_origin: Option<String>) -> Result<(), String> {
     let password = match std::env::var_os("ZTE_AGENT_PASSWORD_FILE") {
         Some(path) if Path::new(&path) == Path::new(PROXY_AUTH_PASSWORD) => {
             validate_auth_directories()?;
@@ -36,6 +37,7 @@ pub fn run(bind: SocketAddr) -> Result<(), String> {
         auth,
         mihomo,
         shutdown: Arc::new(AtomicBool::new(false)),
+        https_origin,
     });
     eprintln!(
         "[agent] starting isolated proxy-management API on {bind}; legacy router initialization is disabled"
@@ -140,7 +142,19 @@ impl ProxyOnlyState {
             auth,
             mihomo: Arc::new(Manager::new_proxy_only_for_test(state_path)),
             shutdown: Arc::new(AtomicBool::new(false)),
+            https_origin: None,
         })
+    }
+
+    pub(crate) fn new_for_test_with_origin(
+        password: &str,
+        salt_path: &Path,
+        state_path: std::path::PathBuf,
+        https_origin: Option<String>,
+    ) -> Result<Self, String> {
+        let mut state = Self::new_for_test(password, salt_path, state_path)?;
+        state.https_origin = https_origin;
+        Ok(state)
     }
 }
 

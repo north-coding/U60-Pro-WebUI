@@ -48,6 +48,7 @@ mod tests {
             AUTH_DIR,
             AUTH_SALT,
             AUTH_PASSWORD,
+            "/data/u60-pro-managed/auth/webui-origin",
         ];
         let legacy = [
             "/data/zte-agent",

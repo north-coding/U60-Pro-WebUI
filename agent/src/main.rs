@@ -61,13 +61,13 @@ fn main() {
         Ok(mode) => mode,
         Err(error) => {
             eprintln!("[agent] invalid startup arguments: {error}");
-            eprintln!("[agent] usage: zte-agent [--proxy-only [--proxy-bind 127.0.0.1:9090]]");
+            eprintln!("[agent] usage: zte-agent [--proxy-only [--proxy-bind 127.0.0.1:9090] [--proxy-https-origin https://u60.local]]");
             std::process::exit(64);
         }
     };
 
-    startup::dispatch(mode, legacy_main, |bind| {
-        if let Err(error) = proxy_only::run(bind) {
+    startup::dispatch(mode, legacy_main, |bind, https_origin| {
+        if let Err(error) = proxy_only::run(bind, https_origin) {
             eprintln!("[agent] proxy-only startup failed: {error}");
             std::process::exit(1);
         }
