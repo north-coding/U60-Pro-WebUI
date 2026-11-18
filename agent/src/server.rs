@@ -1102,6 +1102,7 @@ mod tests {
 
     struct SmokeServer {
         address: SocketAddr,
+        password: String,
         stop: Arc<AtomicBool>,
         worker: Option<JoinHandle<()>>,
         root: std::path::PathBuf,
@@ -1152,9 +1153,10 @@ mod tests {
         });
         let bytes = serde_json::to_vec_pretty(&saved_state).unwrap();
         crate::storage::atomic_write(&state_file, &bytes).unwrap();
+        let password = "A".repeat(43);
         let state = Arc::new(
             ProxyOnlyState::new_for_test_with_origin(
-                "synthetic-password",
+                &password,
                 &root.join("auth/salt"),
                 state_file,
                 https_origin.map(str::to_string),
@@ -1178,6 +1180,7 @@ mod tests {
         });
         SmokeServer {
             address,
+            password,
             stop,
             worker: Some(worker),
             root,
@@ -1269,12 +1272,13 @@ mod tests {
             .0,
             401
         );
+        let login_request = format!(r#"{{"password":"{}"}}"#, server.password);
         let (status, _, login_body) = http(
             server.address,
             "POST",
             "/api/auth/login",
             &[("Content-Type", "application/json")],
-            r#"{"password":"synthetic-password"}"#,
+            &login_request,
         );
         assert_eq!(status, 200);
         let token = serde_json::from_str::<serde_json::Value>(&login_body).unwrap()["data"]

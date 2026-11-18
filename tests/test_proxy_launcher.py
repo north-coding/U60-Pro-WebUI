@@ -3,6 +3,7 @@ import json
 import os
 import stat
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,7 +11,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = ROOT / "scripts/device/start-proxy-agent.sh"
-RC_PREP = ROOT / "scripts/device/prepare-proxy-rc-local.py"
+sys.path.insert(0, str(ROOT / "scripts/device"))
+import startup_transaction
+
+TEST_PASSWORD = "A" * 43
 
 
 class ProxyLauncherTests(unittest.TestCase):
@@ -34,7 +38,7 @@ class ProxyLauncherTests(unittest.TestCase):
             "#!/bin/sh\nif [ \"${1:-}\" = -v ]; then echo 'Mihomo Meta v1.19.32 linux arm64'; exit 0; fi\n[ \"${1:-}\" != -t ] || [ \"${U60_TEST_CONFIG_FAIL:-0}\" != 1 ]\n",
         )
         password = self.root / "auth/password"
-        password.write_text("synthetic_password_123\n")
+        password.write_text(TEST_PASSWORD + "\n")
         password.chmod(0o600)
         self.curl = Path(self.temp.name) / "curl-mock"
         self._write_executable(self.curl, self._curl_mock())
@@ -64,7 +68,7 @@ if url.endswith("/api/proxy/capabilities"):
     print('{"ok":true,"data":{"mode":"proxy_only","auth_required":true,"features":["proxy_management"]}}')
 elif url.endswith("/api/auth/login"):
     body = sys.stdin.read()
-    if 'synthetic_password_123' not in body:
+    if '__TEST_PASSWORD__' not in body:
         raise SystemExit(22)
     print('{"ok":true,"data":{"token":"' + 'a' * 64 + '"}}')
 elif url.endswith("/api/proxy/agent/stop"):
@@ -77,7 +81,7 @@ elif url.endswith("/api/proxy/agent/stop"):
     print('{"ok":true,"data":{"stopping":true,"mihomo_preserved":true}}')
 else:
     raise SystemExit(22)
-'''
+'''.replace("__TEST_PASSWORD__", TEST_PASSWORD)
 
     def _write_hash_metadata(self, binary: Path):
         binary.with_name(binary.name + ".sha256").write_text(hashlib.sha256(binary.read_bytes()).hexdigest() + "\n")
@@ -164,7 +168,13 @@ else:
         password = self.root / "auth/password"
         password.unlink()
         self.assertNotEqual(self._run("start").returncode, 0)
-        password.write_text("synthetic_password_123\n")
+        password.write_text("weak\n")
+        password.chmod(0o600)
+        self.assertNotEqual(self._run("start").returncode, 0)
+        password.write_text("A" * 42 + "B\n")
+        password.chmod(0o600)
+        self.assertNotEqual(self._run("start").returncode, 0)
+        password.write_text(TEST_PASSWORD + "\n")
         password.chmod(0o644)
         self.assertNotEqual(self._run("start").returncode, 0)
         password.chmod(0o600)
@@ -218,40 +228,22 @@ else:
 
 
 class ProxyStartupEntryTests(unittest.TestCase):
-    def test_default_dry_run_and_apply_change_only_the_exact_project_entry(self):
-        with tempfile.TemporaryDirectory(prefix="u60-rc-local-") as temp:
-            path = Path(temp) / "rc.local"
-            original = b"#!/bin/sh\nstock-before\nsh /data/local/tmp/start_zte_agent.sh\nstock-after\n"
-            path.write_bytes(original)
-            path.chmod(0o755)
-            dry = subprocess.run(["python3", str(RC_PREP), "--rc-local", str(path)], text=True, capture_output=True)
-            self.assertEqual(dry.returncode, 0, dry.stderr)
-            self.assertEqual(path.read_bytes(), original)
-            applied = subprocess.run(["python3", str(RC_PREP), "--rc-local", str(path), "--apply"], text=True, capture_output=True)
-            self.assertEqual(applied.returncode, 0, applied.stderr)
-            updated = path.read_bytes()
-            self.assertIn(b"stock-before\n", updated)
-            self.assertIn(b"stock-after\n", updated)
-            self.assertIn(b"sh /data/u60-pro-managed/agent/start-proxy-agent.sh start\n", updated)
-            self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o755)
-            self.assertEqual(subprocess.run(["sh", "-n", str(path)]).returncode, 0)
+    def test_transform_preserves_unrelated_bytes_and_rollback_removes_only_project_entry(self):
+        original = b"#!/bin/sh\r\n# stock bytes\r\necho stock\r\nsh /data/local/tmp/start_zte_agent.sh\r\necho after\r\n"
+        candidate, rollback = startup_transaction.transform_startup(original)
+        self.assertEqual(candidate, original.replace(b"sh /data/local/tmp/start_zte_agent.sh\r\n", b"sh /data/u60-pro-managed/agent/start-proxy-agent.sh start\r\n"))
+        self.assertEqual(rollback, b"#!/bin/sh\r\n# stock bytes\r\necho stock\r\necho after\r\n")
 
-    def test_missing_duplicate_or_symlinked_entry_is_never_rewritten(self):
-        with tempfile.TemporaryDirectory(prefix="u60-rc-local-negative-") as temp:
-            root = Path(temp)
-            path = root / "rc.local"
-            for content in (b"#!/bin/sh\nstock\n", b"sh /data/local/tmp/start_zte_agent.sh\nsh /data/local/tmp/start_zte_agent.sh\n"):
-                path.write_bytes(content)
-                result = subprocess.run(["python3", str(RC_PREP), "--rc-local", str(path), "--apply"], capture_output=True)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertEqual(path.read_bytes(), content)
-            target = root / "target"
-            target.write_bytes(b"sh /data/local/tmp/start_zte_agent.sh\n")
-            link = root / "link"
-            link.symlink_to(target)
-            result = subprocess.run(["python3", str(RC_PREP), "--rc-local", str(link), "--apply"], capture_output=True)
-            self.assertNotEqual(result.returncode, 0)
-            self.assertEqual(target.read_bytes(), b"sh /data/local/tmp/start_zte_agent.sh\n")
+    def test_transform_rejects_missing_duplicate_modified_and_candidate_entries(self):
+        for content in (
+            b"#!/bin/sh\necho stock\n",
+            b"sh /data/local/tmp/start_zte_agent.sh\nsh /data/local/tmp/start_zte_agent.sh\n",
+            b"sh /data/local/tmp/start_zte_agent.sh extra\n",
+            b"sh /data/local/tmp/start_zte_agent.sh \r\n",
+            b"sh /data/u60-pro-managed/agent/start-proxy-agent.sh start\n",
+        ):
+            with self.subTest(content=content), self.assertRaises(startup_transaction.TransactionError):
+                startup_transaction.transform_startup(content)
 
 
 if __name__ == "__main__":

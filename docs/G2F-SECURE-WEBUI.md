@@ -29,7 +29,10 @@ The Agent currently keys failed-login lockout to the TCP peer address. Behind
 a local reverse proxy, all iPhone clients appear to the Agent as loopback.
 Before deployment, the gateway must provide source-aware login throttling (or
 an independently reviewed trusted-client-address contract); this change does
-not add trust in caller-supplied forwarding headers.
+not add trust in caller-supplied `X-Forwarded-For`, `Forwarded`, or other
+client-address headers. Exact HTTPS Origin matching and the proxy-only
+endpoint allowlist remain enforced at the Agent. Source-aware gateway login
+throttling is a deployment blocker.
 
 The local HTTPS integration test generates an ephemeral test certificate in
 a disposable temporary directory, serves a small synthetic UI, and forwards

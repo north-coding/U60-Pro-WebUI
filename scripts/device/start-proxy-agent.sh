@@ -128,9 +128,17 @@ preflight_agent() {
     validate_dir "$MIHOMO_DIR"
     validate_dir "$AUTH_DIR"
     validate_file "$PASSWORD_FILE" 600
+    password_size=$(wc -c < "$PASSWORD_FILE" | tr -d '[:space:]')
+    [ "$password_size" = 44 ] || fail "proxy-only password file must contain one 43-character secret and newline"
+    awk 'NR > 1 { exit 1 } END { if (NR != 1) exit 1 }' "$PASSWORD_FILE" || fail "proxy-only password file must contain exactly one line"
     IFS= read -r PASSWORD < "$PASSWORD_FILE" || fail "cannot read Agent credential file"
     case "$PASSWORD" in
-        ''|*[!A-Za-z0-9_-]*) fail "password file must contain one nonempty base64url-safe password line" ;;
+        *[!A-Za-z0-9_-]*) fail "proxy-only password file is malformed" ;;
+    esac
+    [ "${#PASSWORD}" = 43 ] || fail "proxy-only password must be a 32-byte base64url secret"
+    case "$PASSWORD" in
+        *[AEIMQUYcgkosw048]) ;;
+        *) fail "proxy-only password is not canonical base64url for 32 bytes" ;;
     esac
     if [ -L "$WEBUI_ORIGIN_FILE" ]; then
         fail "HTTPS WebUI origin must not be a symbolic link"

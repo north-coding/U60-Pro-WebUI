@@ -99,7 +99,11 @@
       {"id": "managed-mihomo-owner-record", "path": "/data/u60-pro-managed/mihomo/mihomo.pid", "kind": "file", "classification": "mihomo_owned", "owner_id": "managed-mihomo", "format": "0600 JSON containing PID, start ticks, executable device/inode/SHA-256, exact argv paths, process owner token, schema and phase"},
       {"id": "managed-mihomo-manager-lock", "path": "/data/u60-pro-managed/mihomo/manager.lock", "kind": "file", "classification": "project_owned", "owner_id": "u60-proxy-agent"},
       {"id": "temporary-staging-dir", "path": "/data/u60-pro-managed/staging", "kind": "directory", "classification": "project_owned", "owner_id": "u60-proxy-managed", "temporary": true},
-      {"id": "temporary-rollback-snapshot", "path": "/data/u60-pro-managed/staging/rollback-snapshot.json", "kind": "file", "classification": "project_owned", "owner_id": "u60-proxy-managed", "temporary": true}
+      {"id": "startup-transaction-dir", "path": "/data/u60-pro-managed/staging/startup-transaction", "kind": "directory", "classification": "project_owned", "owner_id": "u60-proxy-managed", "temporary": true},
+      {"id": "startup-transaction-original", "path": "/data/u60-pro-managed/staging/startup-transaction/original.rc.local", "kind": "file", "classification": "project_owned", "owner_id": "u60-proxy-managed", "temporary": true, "mode": "0400"},
+      {"id": "startup-transaction-metadata", "path": "/data/u60-pro-managed/staging/startup-transaction/metadata.json", "kind": "file", "classification": "project_owned", "owner_id": "u60-proxy-managed", "temporary": true, "mode": "0400"},
+      {"id": "startup-transaction-state", "path": "/data/u60-pro-managed/staging/startup-transaction/state.json", "kind": "file", "classification": "project_owned", "owner_id": "u60-proxy-managed", "temporary": true, "mode": "0600"},
+      {"id": "startup-transaction-lock", "path": "/data/u60-pro-managed/staging/startup-transaction.lock", "kind": "file", "classification": "project_owned", "owner_id": "u60-proxy-managed", "temporary": true, "mode": "0600"}
     ],
     "cleanup_separation": "Every managed runtime path must remain disjoint from every legacy cleanup target. Unknown, shared, or overlapping ownership blocks all cleanup planning."
   },
@@ -108,9 +112,26 @@
     "agent_transport": "plain_http_loopback_only",
     "remote_plain_http_credentials_allowed": false,
     "https_termination_provided": false,
+    "forwarded_client_address_headers_trusted": false,
+    "source_aware_login_throttling": "deployment_blocker_behind_loopback_gateway",
+    "proxy_only_password": {"format": "canonical unpadded base64url encoding of 32 random bytes", "length": 43, "path": "/data/u60-pro-managed/auth/password", "mode": "0600", "legacy_full_agent_auth_changed": false},
     "proxy_only_dashboard_features": ["subscriptions", "nodes", "overview", "settings"],
     "unrelated_router_endpoints_in_proxy_only_mode": "404_or_denied",
     "deployment_gate": "provide_and_independently_review_a_trusted_https_path_before_iPhone_or_other_LAN_management"
+  },
+  "startup_activation_transaction": {
+    "implementation": "scripts/device/startup_transaction.py",
+    "execution_mode": "marked_temporary_synthetic_root_only",
+    "device_execution_enabled": false,
+    "target": "/etc/rc.local",
+    "snapshot_path": "/data/u60-pro-managed/staging/startup-transaction/original.rc.local",
+    "snapshot_mode": "0400",
+    "snapshot_integrity": "sha256 plus original owner, group, mode, device and inode metadata",
+    "candidate_entry": "sh /data/u60-pro-managed/agent/start-proxy-agent.sh start",
+    "replace_policy": "replace only one exact unchanged project-owned old Agent entry; preserve all other bytes",
+    "health_check": {"scope": "marked_temporary_synthetic_root_only", "auth": "synthetic loopback capability discovery, test-password login, bearer-authenticated proxy status", "total_timeout_seconds": 8, "per_request_timeout_seconds": 1, "attempts": 8, "device_gate": "verify listener executable and process identity before any production credential is sent; no device health adapter is implemented"},
+    "rollback_policy": "remove only the exact new proxy-only startup entry; retain the original snapshot; never restore the abandoned legacy startup entry",
+    "process_and_network_cleanup": "none; do not stop unverified processes or delete routes, firewall rules, interfaces, or legacy Mihomo files"
   },
   "legacy_installers": [
     {
@@ -234,15 +255,15 @@
     {"id": "new-agent-arch", "path": "/data/u60-pro-managed/agent/zte-agent.arch", "arch": null, "purpose": "aarch64 build declaration checked against the binary build info"},
     {"id": "mihomo-sha256", "path": "/data/u60-pro-managed/mihomo/mihomo.sha256", "arch": null, "purpose": "verified artifact identity sidecar required by the launcher"},
     {"id": "mihomo-arch", "path": "/data/u60-pro-managed/mihomo/mihomo.arch", "arch": null, "purpose": "aarch64 build declaration checked against Mihomo version output"},
-    {"id": "managed-auth-password", "path": "/data/u60-pro-managed/auth/password", "arch": null, "purpose": "root-owned 0600 Agent login credential, never placed in the Agent environment"},
+    {"id": "managed-auth-password", "path": "/data/u60-pro-managed/auth/password", "arch": null, "purpose": "owner-only 0600 canonical base64url credential generated from 32 random bytes, never printed or placed in the Agent environment"},
     {"id": "fresh-mihomo-config", "path": "/data/u60-pro-managed/mihomo/config.yaml", "arch": null, "required_before_mihomo_start": true, "purpose": "generated from new managed settings and syntax-checked by the Agent immediately before start; no old config import"},
     {"id": "new-startup-script", "path": "/data/u60-pro-managed/agent/start-proxy-agent.sh", "arch": null, "purpose": "explicit launcher contract invokes zte-agent --proxy-only --proxy-bind 127.0.0.1:9090"},
-    {"id": "rollback-snapshot", "path": "/data/u60-pro-managed/staging/rollback-snapshot.json", "arch": null, "purpose": "project Agent/startup and rc.local baseline only; excludes abandoned Mihomo configuration and provider data"}
+    {"id": "startup-transaction-snapshot", "path": "/data/u60-pro-managed/staging/startup-transaction/original.rc.local", "arch": null, "purpose": "complete protected original startup file, written and verified before exact-entry replacement; excludes abandoned Mihomo configuration and provider data"}
   ],
   "rollback_scope": {
-    "preserve": ["the complete pre-change rc.local body", "exact project-owned startup line", "existing auth inputs without exposing them", "stock router services"],
+    "preserve": ["the complete pre-change rc.local snapshot and its digest/identity metadata", "all unrelated rc.local bytes", "existing auth inputs without exposing them", "stock router services"],
     "exclude": ["old Mihomo configuration", "old subscriptions and provider cache", "stock firmware, SSH keys, USB assets, and cellular/Wi-Fi configuration"],
-    "fallback": "stop only positively identified new project processes and return the router to stock forwarding; do not restart legacy Mihomo"
+    "fallback": "remove only the exact new proxy-only startup entry and retain the verified original snapshot; do not start the abandoned legacy Agent or Mihomo, stop unverified processes, or change network resources"
   },
   "offline_preparation_checks": [
     "artifact_hashes_verified",
@@ -250,12 +271,14 @@
     "startup_script_syntax_validated",
     "rollback_snapshot_complete",
     "rc_local_snapshot_complete",
-    "rc_local_exact_entry_restore_ready",
+    "startup_transaction_exact_entry_rollback_ready",
+    "startup_transaction_authenticated_health_bounded",
     "new_service_stop_recovery_checked",
     "stock_paths_excluded_from_mutations"
   ],
   "failure_recovery_checks": [
-    "rc_local_exact_entry_restore_ready",
+    "startup_transaction_exact_entry_rollback_ready",
+    "startup_transaction_recovery_fail_closed",
     "new_service_stop_recovery_checked",
     "stock_paths_excluded_from_mutations"
   ],
@@ -301,9 +324,9 @@
     },
     {
       "id": "startup-activation-contract",
-      "files": ["scripts/render-agent-startup.py", "scripts/device/update-rc-local.sh", "scripts/deploy-components.py"],
-      "requirement": "Stage the explicit mode in the project-owned startup script and replace only its exact rc.local line after syntax, snapshot, rollback, authenticated health, and single-process ownership checks.",
-      "status": "launcher_and_dry_run_implemented_offline_no_device_staging"
+      "files": ["agent/src/proxy_only.rs", "scripts/device/start-proxy-agent.sh", "scripts/device/prepare-proxy-rc-local.py", "scripts/device/startup_transaction.py"],
+      "requirement": "For offline verification, require a protected complete snapshot, exact project-owned entry, shell syntax, verified artifact hashes/architectures/paths, and bounded authenticated health before changing a marked synthetic rc.local. Roll back by removing only the new entry; preserve stock bytes and never restore the abandoned legacy entry. Device execution remains disabled.",
+      "status": "implemented_and_tested_synthetic_only_device_execution_disabled"
     },
     {
       "id": "offline-startup-tests",
@@ -313,11 +336,11 @@
     }
   ],
   "failure_recovery_conditions": [
-    "Keep the stock rc.local body and restore or remove only the exact project-owned startup line using the verified snapshot and sh -n.",
-    "If activation fails, stop only positively identified new project processes and return to stock forwarding; do not rely on or restart legacy Mihomo.",
+    "Keep a complete mode-0400 original rc.local snapshot and remove only the exact new proxy-only entry on rollback; never restore the abandoned legacy Agent entry.",
+    "Do not stop processes as part of the startup-file transaction; process cleanup requires separately verified ownership and approval.",
     "Leave Mihomo-owned resources untouched when process or path ownership is unknown.",
     "Do not remove a live process, route, firewall rule, SSH component, USB asset, or stock service during recovery.",
-    "Require shell syntax validation and authenticated health checks before changing the exact startup entry."
+    "Require shell syntax, artifact identity, path, rollback snapshot and bounded authenticated health validation before a synthetic startup-entry replacement; device mutation is disabled."
   ],
   "routing_policy": {
     "automatic_cleanup_targets": [],
