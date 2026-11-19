@@ -10,6 +10,7 @@ use std::io::Read;
 #[cfg(target_os = "linux")]
 use std::os::fd::FromRawFd;
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -185,9 +186,107 @@ fn acquire_lock_at(lock_path: &Path) -> Result<ManagerLock, String> {
     Ok(ManagerLock { _file: file })
 }
 
+/// Refuse coexistence with the observed legacy installation. This is a
+/// read-only exclusion gate, never proof that a PID may be signalled.
+fn check_legacy_mihomo_absent(proc_root: &Path, legacy_binary: &Path) -> Result<(), String> {
+    fn disappeared(error: &std::io::Error) -> bool {
+        error.kind() == std::io::ErrorKind::NotFound || error.raw_os_error() == Some(libc::ESRCH)
+    }
+
+    let legacy_identity = match fs::metadata(legacy_binary) {
+        Ok(metadata) => Some(FileIdentity::from_metadata(&metadata)),
+        Err(error) if disappeared(&error) => None,
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect the legacy Mihomo executable: {error}"
+            ))
+        }
+    };
+    let legacy_dir = legacy_binary
+        .parent()
+        .ok_or("legacy Mihomo executable has no parent")?;
+    let launcher = legacy_dir.join("start-mihomo.sh");
+    let config = legacy_dir.join("config.yaml");
+    let deleted_name = format!("{} (deleted)", legacy_binary.display());
+    let scan_error = |error| format!("cannot check for legacy Mihomo in procfs: {error}");
+    for entry in fs::read_dir(proc_root).map_err(scan_error)? {
+        let entry = entry.map_err(scan_error)?;
+        if entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<u32>().ok())
+            .is_none()
+        {
+            continue;
+        }
+        let exe = entry.path().join("exe");
+        let path = match fs::read_link(&exe) {
+            Ok(path) => path,
+            Err(error) if disappeared(&error) => continue,
+            Err(error) => return Err(scan_error(error)),
+        };
+        if path == legacy_binary || path == Path::new(&deleted_name) {
+            return Err("legacy Mihomo is still running; cutover is blocked".into());
+        }
+        if let Some(legacy_identity) = legacy_identity {
+            match fs::metadata(&exe) {
+                Ok(metadata) if FileIdentity::from_metadata(&metadata) == legacy_identity => {
+                    return Err(
+                        "a process is using the legacy Mihomo executable; cutover is blocked"
+                            .into(),
+                    );
+                }
+                Ok(_) => {}
+                Err(error) if disappeared(&error) => {}
+                Err(error) => return Err(scan_error(error)),
+            }
+        }
+        let cmdline = match fs::read(entry.path().join("cmdline")) {
+            Ok(cmdline) => cmdline,
+            Err(error) if disappeared(&error) => continue,
+            Err(error) => return Err(scan_error(error)),
+        };
+        let mut args = cmdline.split(|byte| *byte == 0);
+        let first = args.next().unwrap_or_default();
+        let legacy_launcher = launcher.as_os_str().as_bytes();
+        if first == legacy_binary.as_os_str().as_bytes() || first == legacy_launcher {
+            return Err(
+                "legacy Mihomo startup or process is still present; cutover is blocked".into(),
+            );
+        }
+        let mut previous = first;
+        for arg in args {
+            if arg == legacy_launcher
+                || (previous == b"-d" && arg == legacy_dir.as_os_str().as_bytes())
+                || (previous == b"-f" && arg == config.as_os_str().as_bytes())
+                || arg.strip_prefix(b"-d=") == Some(legacy_dir.as_os_str().as_bytes())
+                || arg.strip_prefix(b"-f=") == Some(config.as_os_str().as_bytes())
+            {
+                return Err(
+                    "a process claims the legacy Mihomo runtime; cutover is blocked".into(),
+                );
+            }
+            previous = arg;
+        }
+    }
+    Ok(())
+}
+
+pub fn preflight_single_mihomo() -> Result<(), String> {
+    check_legacy_mihomo_absent(Path::new("/proc"), Path::new("/data/mihomo/mihomo"))
+}
+
+pub fn preflight_legacy_controller(ip: &str) -> Result<(), String> {
+    preflight_proxy_port(ip, 9090)
+        .map_err(|error| format!("legacy LAN controller port must be free before cutover: {error}"))
+}
+
 /// Recover only a process whose durable record, PID start ticks, executable,
 /// arguments, owner token, and binary identity all agree.
 pub fn recover_proxy_only_process() -> Recovery {
+    if let Err(error) = preflight_single_mihomo() {
+        return Recovery::Blocked(error);
+    }
     match ownership::inspect_owner(
         Path::new(PIDFILE),
         Path::new("/proc"),
@@ -439,6 +538,7 @@ pub fn log_tail_error() -> Option<String> {
 pub fn spawn() -> Result<Process, String> {
     ensure_proxy_only_runtime_dir()?;
     let binary = ownership::validate_binary(Path::new(BINARY))?;
+    let boot_id = ownership::read_boot_id(Path::new("/proc"))?;
     validate_optional_private_file(Path::new(LOG))?;
     let prior_log_identity = match fs::symlink_metadata(LOG) {
         Ok(metadata) => Some(FileIdentity::from_metadata(&metadata)),
@@ -476,6 +576,7 @@ pub fn spawn() -> Result<Process, String> {
         Path::new(DIR),
         Path::new(CONFIG),
         owner_token.clone(),
+        boot_id,
     );
     let mut owner_file = ownership::reserve_owner_file(Path::new(PIDFILE), &owner)?;
     let mut cmd = Command::new(BINARY);
@@ -1284,6 +1385,41 @@ pub fn preflight_proxy_port(ip: &str, port: u16) -> Result<(), String> {
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn legacy_mihomo_blocks_start_and_recovery_even_without_listeners() {
+        let root = std::env::temp_dir().join(format!("u60-legacy-{}", std::process::id()));
+        let proc_root = root.join("proc");
+        let legacy = root.join("legacy-mihomo");
+        let proc_pid = proc_root.join("41");
+        fs::create_dir_all(&proc_pid).unwrap();
+        fs::write(&legacy, b"synthetic executable").unwrap();
+        let exe = proc_pid.join("exe");
+        let alias = root.join("other-name");
+        fs::write(&alias, b"different executable").unwrap();
+        std::os::unix::fs::symlink(&alias, &exe).unwrap();
+        assert!(check_legacy_mihomo_absent(&proc_root, &legacy).is_ok());
+        fs::remove_file(&exe).unwrap();
+        fs::remove_file(&alias).unwrap();
+        fs::hard_link(&legacy, &alias).unwrap();
+        std::os::unix::fs::symlink(&alias, &exe).unwrap();
+        assert!(check_legacy_mihomo_absent(&proc_root, &legacy).is_err());
+        fs::remove_file(&exe).unwrap();
+        fs::remove_file(&legacy).unwrap();
+        std::os::unix::fs::symlink(format!("{} (deleted)", legacy.display()), &exe).unwrap();
+        assert!(check_legacy_mihomo_absent(&proc_root, &legacy).is_err());
+        fs::remove_file(&exe).unwrap();
+        std::os::unix::fs::symlink(&legacy, &exe).unwrap();
+        assert!(check_legacy_mihomo_absent(&proc_root, &legacy).is_err());
+        fs::remove_file(&exe).unwrap();
+        std::os::unix::fs::symlink(&alias, &exe).unwrap();
+        let cmdline = proc_pid.join("cmdline");
+        fs::write(&cmdline, [legacy.as_os_str().as_bytes(), b"\0"].concat()).unwrap();
+        assert!(check_legacy_mihomo_absent(&proc_root, &legacy).is_err());
+        fs::write(&cmdline, b"unrelated\0").unwrap();
+        assert!(check_legacy_mihomo_absent(&proc_root, &legacy).is_ok());
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn proxy_only_runtime_paths_require_owned_private_paths() {

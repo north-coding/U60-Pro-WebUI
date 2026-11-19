@@ -17,7 +17,7 @@ from typing import Any
 
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 RC_LOCAL_PATH = "/etc/rc.local"
-APPROVED_RC_ENTRY = "sh /data/local/tmp/start_zte_agent.sh"
+APPROVED_RC_ENTRY = "sh /data/mihomo/start-mihomo.sh >/data/mihomo/autostart.log 2>&1 &"
 OWNER_CLASSES = {
     "stock_zte_protected",
     "project_owned",

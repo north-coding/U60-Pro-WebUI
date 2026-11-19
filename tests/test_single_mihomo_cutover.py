@@ -168,7 +168,7 @@ class SingleMihomoCutoverValidator(unittest.TestCase):
             for item in manifest["single_instance_storage"]["managed_runtime_paths"]
             if item["id"] == "managed-agent-binary"
         )
-        managed["path"] = "/data/zte-agent"
+        managed["path"] = "/data/mihomo/mihomo"
         result = validator.validate(manifest, state)
         self.assertEqual(result["candidate_actions"], [])
         self.assertTrue(any("overlaps legacy cleanup target" in blocker for blocker in result["blockers"]))
@@ -184,14 +184,14 @@ class SingleMihomoCutoverValidator(unittest.TestCase):
 
     def test_cleanup_inventory_cannot_alias_managed_runtime(self):
         state = synthetic_inventory()
-        state["managed_runtime_paths"][0]["path"] = "/data/zte-agent"
+        state["managed_runtime_paths"][0]["path"] = "/data/mihomo/mihomo"
         result = self.report(state)
         self.assertEqual(result["candidate_actions"], [])
         self.assertTrue(any("overlaps a cleanup target" in blocker for blocker in result["blockers"]))
 
     def test_active_managed_service_blocks_cleanup_plan(self):
         state = synthetic_inventory()
-        state["services"][1]["state"] = "running"
+        next(service for service in state["services"] if service["name"] == "legacy-mihomo")["state"] = "running"
         result = self.report(state)
         self.assertEqual(result["candidate_actions"], [])
         self.assertTrue(any("must be stopped" in blocker for blocker in result["blockers"]))

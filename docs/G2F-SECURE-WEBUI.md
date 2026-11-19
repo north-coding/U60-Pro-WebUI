@@ -49,20 +49,27 @@ device-side gateway, certificate, or deployment behavior.
 
 ## Existing router-facing evidence
 
-The repository's existing dashboard launcher runs the pinned upstream
-`dashboard-uhttpd` on plain HTTP port `8080`. The existing Agent has no TLS
-stack. The source tree contains no TLS-enabled dashboard invocation, TLS
-reverse-proxy configuration, or verified TLS module/package for the router.
-The extracted firmware tree is not present in this worktree, and no device
-inspection was performed. Therefore the current router cannot be assumed to
-have a usable TLS listener, TLS module, or free LAN port for this design.
+The repository launches the project dashboard with upstream `dashboard-uhttpd`
+on port 8080 over HTTP. The Agent has no TLS stack. The Owner's 2026-11-19
+read-only snapshot reports that stock uhttpd serves ports 80 and 443 from
+`/usr/zte_web/web` with temporary ZTE certificate files. This establishes stock
+TLS capability. The certificate is self-signed, and neither the snapshot nor
+the repository establishes reverse proxy or per-source rate limiting support.
 
-Do not change the dashboard to a LAN HTTPS binding until a separate read-only
-device stage identifies the installed uhttpd build/modules, port ownership,
-LAN firewall reachability, writable certificate paths, and a project-owned
-gateway that can preserve `Origin` and forward only to the loopback Agent.
-The current 8080 service remains plain HTTP for legacy full-Agent users; the
-proxy-only UI must be opened through the eventual trusted HTTPS origin.
+Keep the stock listener, web root and certificates reserved for ZTE. The
+smallest candidate is a separate project-owned HTTPS origin on a free LAN port
+serving the existing dashboard bundle and forwarding the explicit Agent API
+allowlist to `127.0.0.1:9090`. Forward Origin unchanged, enforce the exact
+management origin and rate-limit login by the connection's actual source IP.
+Strip client-supplied forwarding headers. Keep the Mihomo controller on its
+private Unix socket. The proxy-only UI requires this trusted HTTPS origin.
+
+Before choosing a gateway, verify one capability: whether an available
+ARM64 gateway build can serve static files and reverse-proxy an explicit path
+allowlist with per-source login limits under TLS, as a separate invocation
+with its own certificate. If the installed uhttpd build cannot do this,
+stage a vetted standalone ARM64 gateway for approval. Verify the chosen LAN
+port is free and reachable under the existing LAN policy before using it.
 
 ## iPhone trust and identity path
 

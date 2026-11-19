@@ -861,6 +861,14 @@ impl Inner {
         }
     }
 
+    fn preflight_cutover(&self, ip: &str) -> Result<(), String> {
+        if self.proxy_only {
+            service::preflight_single_mihomo()?;
+            service::preflight_legacy_controller(ip)?;
+        }
+        Ok(())
+    }
+
     fn start(&mut self) -> Result<(), String> {
         if let Some(reason) = &self.blocked_reason {
             return Err(format!("proxy manager is blocked: {reason}"));
@@ -881,6 +889,7 @@ impl Inner {
         let state = self.state.clone();
         preflight_then(
             || {
+                self.preflight_cutover(&ip)?;
                 service::preflight_routing(state.settings.tun)?;
                 service::preflight_proxy_port(&ip, state.settings.mixed_port)
             },
@@ -946,6 +955,9 @@ impl Inner {
         // The current routing state cannot be attributed to Mihomo from its
         // priority/table alone. Refuse to stop or restart while any such state
         // is present; callers can stop explicitly and inspect before starting.
+        if self.proxy_only {
+            self.preflight_cutover(&lan_ip()?)?;
+        }
         service::preflight_routing(self.state.settings.tun)?;
         self.stop()?;
         self.start()
@@ -987,11 +999,12 @@ impl Inner {
         let previous_file = if will_start {
             preflight_then(
                 || {
+                    let Some(ip) = preflight_ip.as_deref() else {
+                        return Err("could not read the router's LAN address".into());
+                    };
+                    self.preflight_cutover(ip)?;
                     service::preflight_routing(next.settings.tun)?;
                     if check_candidate_port {
-                        let Some(ip) = preflight_ip.as_deref() else {
-                            return Err("could not read the router's LAN address".into());
-                        };
                         service::preflight_proxy_port(ip, next.settings.mixed_port)?;
                     }
                     Ok(())
@@ -1069,6 +1082,7 @@ impl Inner {
             });
         let mut traffic = Value::Null;
         let mut route = Value::Null;
+        let mut controller_ready = false;
         if running {
             let ctl = Controller;
             if let Ok(c) = ctl.get("/connections") {
@@ -1093,6 +1107,9 @@ impl Inner {
                 });
             }
             if let Ok(p) = ctl.get("/proxies") {
+                controller_ready = p["proxies"]
+                    .as_object()
+                    .is_some_and(|proxies| !proxies.is_empty());
                 route = main_route(&p["proxies"]);
             }
         }
@@ -1105,6 +1122,7 @@ impl Inner {
             "version": self.version,
             "running": running,
             "lifecycle": lifecycle,
+            "controller_ready": controller_ready,
             "pid": process.map(|p| p.pid),
             "uptime_secs": process.filter(|_| running).map(|p| p.started.elapsed().as_secs()),
             "rss_bytes": process.filter(|_| running).and_then(Process::rss_bytes),

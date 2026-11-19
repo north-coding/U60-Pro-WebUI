@@ -8,16 +8,18 @@ launcher. Device execution remains disabled pending separate Owner approval.
 from __future__ import annotations
 
 import argparse
+import json
 from pathlib import Path
 import sys
 import time
 
-from startup_transaction import StartupTransaction, TransactionError, transform_startup
+from startup_transaction import StartupTransaction, TransactionError
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--test-root", required=True, type=Path, help="marked disposable synthetic filesystem root")
+    parser.add_argument("--inventory", type=Path, help="verified synthetic startup file identity JSON")
     parser.add_argument("--apply", action="store_true", help="apply the transaction to the synthetic tree only")
     parser.add_argument("--recover", action="store_true", help="recover an interrupted synthetic transaction")
     parser.add_argument(
@@ -36,10 +38,11 @@ def main() -> int:
             result = transaction.recover_pending()
             print(f"synthetic recovery: {result}")
             return 0
+        if args.inventory is None:
+            parser.error("--inventory is required for dry-run and apply")
+        identity = json.loads(args.inventory.read_text(encoding="utf-8"))
         if not args.apply:
-            transaction._validate_layout()
-            content = transaction.rc.read_bytes()
-            transform_startup(content)
+            transaction.dry_run(identity)
             print("dry run: candidate and artifacts validated; no files changed; device execution is disabled")
             return 0
 
@@ -49,7 +52,7 @@ def main() -> int:
                 return False
             return args.health_result == "healthy"
 
-        transaction.activate(lambda: None, synthetic_health, total_timeout=0.3, request_timeout=0.05, attempts=3, interval=0.01)
+        transaction.activate(lambda: None, synthetic_health, expected_identity=identity, total_timeout=0.3, request_timeout=0.05, attempts=3, interval=0.01)
         print("synthetic activation committed; no Agent or device service was started")
         return 0
     except (OSError, ValueError, TransactionError) as error:

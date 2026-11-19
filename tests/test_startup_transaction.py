@@ -25,8 +25,8 @@ import startup_transaction as startup
 
 
 PASSWORD = "A" * proxy_credentials.PASSWORD_LENGTH
-OLD_LINE = b"sh /data/local/tmp/start_zte_agent.sh\n"
-NEW_LINE = b"sh /data/u60-pro-managed/agent/start-proxy-agent.sh start\n"
+OLD_LINE = b"sh /data/mihomo/start-mihomo.sh >/data/mihomo/autostart.log 2>&1 &\n"
+NEW_LINE = b"sh /data/u60-pro-managed/agent/start-proxy-agent.sh start &\n"
 
 
 class StartupFixture(unittest.TestCase):
@@ -47,8 +47,10 @@ class StartupFixture(unittest.TestCase):
         for path in (self.agent_dir, self.mihomo_dir, self.auth_dir, self.staging_dir):
             path.mkdir(mode=0o700)
         self.rc = self.root / "etc/rc.local"
-        self.original = b"#!/bin/sh\necho stock-before\n" + OLD_LINE + b"echo stock-after\n"
-        self.safe = b"#!/bin/sh\necho stock-before\necho stock-after\n"
+        prefix = b"#!/bin/sh\n" + b"# stock startup bytes\n" * 40 + b"sh /data/local/tmp/start_dropbear.sh\n"
+        suffix = b"echo stock-after\nexit 0\n"
+        self.original = prefix + OLD_LINE + suffix
+        self.safe = prefix + suffix
         self.rc.write_bytes(self.original)
         self.rc.chmod(0o755)
         self.password_file = self.auth_dir / "password"
@@ -61,6 +63,7 @@ class StartupFixture(unittest.TestCase):
         config.write_text("mode: rule\n")
         config.chmod(0o600)
         self.tx = startup.StartupTransaction(self.root)
+        self.inventory = startup.startup_identity(self.original, self.rc.stat())
 
     def tearDown(self):
         self.temp.cleanup()
@@ -78,6 +81,7 @@ class StartupFixture(unittest.TestCase):
             arch_file.chmod(0o600)
 
     def _activate(self, probe=lambda _deadline: True, **kwargs):
+        kwargs.setdefault("expected_identity", self.inventory)
         self.tx.activate(lambda: None, probe, **kwargs)
 
 
@@ -109,7 +113,7 @@ class StartupTransactionTests(StartupFixture):
 
     def test_activation_callback_failure_uses_the_same_fail_closed_rollback(self):
         with self.assertRaises(startup.ActivationFailed):
-            self.tx.activate(lambda: (_ for _ in ()).throw(RuntimeError("synthetic launch failure")), lambda _d: True)
+            self.tx.activate(lambda: (_ for _ in ()).throw(RuntimeError("synthetic launch failure")), lambda _d: True, expected_identity=self.inventory)
         self.assertEqual(self.rc.read_bytes(), self.safe)
 
     def test_missing_duplicate_modified_and_unexpected_project_entries_are_rejected(self):
@@ -117,17 +121,61 @@ class StartupTransactionTests(StartupFixture):
             b"#!/bin/sh\necho stock\n",
             OLD_LINE + OLD_LINE,
             b"#!/bin/sh\n  " + OLD_LINE,
-            b"#!/bin/sh\nsh /data/local/tmp/start_zte_agent.sh extra\n",
+            b"#!/bin/sh\nsh /data/mihomo/start-mihomo.sh >/data/mihomo/autostart.log 2>&1 & extra\n",
             b"#!/bin/sh\n" + NEW_LINE,
+            b"#!/bin/sh\nsh /data/local/tmp/start_zte_agent.sh\n",
+            OLD_LINE + b"/data/mihomo/mihomo -d /data/mihomo &\n",
+            OLD_LINE + b"sh /data/local/tmp/start_zte_agent.sh\n",
         ]
         for content in variants:
             with self.subTest(content=content):
                 self.rc.write_bytes(content)
                 before = self.rc.read_bytes()
                 with self.assertRaises(startup.TransactionError):
-                    self._activate()
+                    self._activate(expected_identity=startup.startup_identity(before, self.rc.stat()))
                 self.assertEqual(self.rc.read_bytes(), before)
                 self.assertFalse(self.tx.transaction.exists())
+
+    def test_inventory_pins_full_content_and_inode_not_line_number(self):
+        self.rc.write_bytes(self.original.replace(b"echo stock-after", b"echo stock-other"))
+        with self.assertRaisesRegex(startup.TransactionError, "verified inventory"):
+            self._activate()
+        self.rc.write_bytes(self.original)
+        fresh = startup.startup_identity(self.original, self.rc.stat())
+        replacement = self.rc.with_name("replacement")
+        replacement.write_bytes(self.original)
+        replacement.chmod(0o755)
+        replacement.replace(self.rc)
+        with self.assertRaisesRegex(startup.TransactionError, "verified inventory"):
+            self._activate(expected_identity=fresh)
+        self.assertFalse(self.tx.transaction.exists())
+
+    def test_startup_identity_is_rechecked_after_snapshot(self):
+        def replace_with_identical_bytes(point):
+            if point == "after-snapshot":
+                other = self.rc.with_name("other")
+                other.write_bytes(self.original)
+                other.chmod(0o755)
+                other.replace(self.rc)
+
+        with self.assertRaisesRegex(startup.TransactionError, "rollback did not complete"):
+            self._activate(failpoint=replace_with_identical_bytes)
+        self.assertEqual(self.rc.read_bytes(), self.original)
+        self.assertEqual((self.tx.transaction / "original.rc.local").read_bytes(), self.original)
+
+    def test_cli_dry_run_and_apply_require_pinned_inventory(self):
+        cli = [sys.executable, str(DEVICE_SCRIPTS / "prepare-proxy-rc-local.py"), "--test-root", str(self.root)]
+        missing = subprocess.run(cli + ["--apply"], capture_output=True, text=True)
+        self.assertNotEqual(missing.returncode, 0)
+        inventory = self.root / "startup-identity.json"
+        inventory.write_text(json.dumps(self.inventory))
+        cli += ["--inventory", str(inventory)]
+        dry = subprocess.run(cli, capture_output=True, text=True)
+        self.assertEqual(dry.returncode, 0, dry.stderr)
+        self.assertEqual(self.rc.read_bytes(), self.original)
+        applied = subprocess.run(cli + ["--apply"], capture_output=True, text=True)
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        self.assertEqual(self.rc.read_bytes(), self.original.replace(OLD_LINE, NEW_LINE))
 
     def test_wrong_owner_permissions_artifact_hash_or_target_path_blocks_before_replacement(self):
         with self.subTest("owner"):
@@ -165,6 +213,18 @@ class StartupTransactionTests(StartupFixture):
         self.assertEqual(self.tx.recover_pending(), "rolled_back")
         self.assertEqual(self.rc.read_bytes(), self.safe)
         self.assertNotIn(OLD_LINE, self.rc.read_bytes())
+
+    def test_recovery_disables_new_entry_even_if_staged_runtime_is_unavailable(self):
+        def interrupt(point):
+            if point == "after-replacement":
+                raise startup.PowerLoss()
+
+        with self.assertRaises(startup.PowerLoss):
+            self._activate(failpoint=interrupt)
+        (self.agent_dir / "zte-agent").unlink()
+        self.password_file.unlink()
+        self.assertEqual(self.tx.recover_pending(), "rolled_back")
+        self.assertEqual(self.rc.read_bytes(), self.safe)
 
     def test_interruption_after_snapshot_leaves_startup_untouched_and_recovers(self):
         def failpoint(point):
@@ -311,6 +371,9 @@ class AuthenticatedHealthProbeTests(StartupFixture):
     def test_probe_uses_loopback_capability_login_and_authenticated_status(self):
         token = "B" * 64
         observed = []
+        status = {"running": True, "enabled": True, "mode": "rule", "preset": "bypass_cn",
+                  "profile": None, "lifecycle": "running", "controller_ready": True,
+                  "tun": False, "tun_active": False}
 
         class Handler(http.server.BaseHTTPRequestHandler):
             def log_message(self, _format, *_args):
@@ -329,7 +392,7 @@ class AuthenticatedHealthProbeTests(StartupFixture):
                 if self.path == "/api/proxy/capabilities":
                     self.send_json(200, {"ok": True, "data": {"mode": "proxy_only", "auth_required": True}})
                 elif self.path == "/api/proxy/status" and self.headers.get("Authorization") == f"Bearer {token}":
-                    self.send_json(200, {"ok": True, "data": {"running": False, "enabled": False, "mode": "rule"}})
+                    self.send_json(200, {"ok": True, "data": status})
                 else:
                     self.send_json(401, {"ok": False, "error": "unauthorized"})
 
@@ -350,11 +413,15 @@ class AuthenticatedHealthProbeTests(StartupFixture):
         try:
             probe = startup.SyntheticLocalAgentHealthProbe(self.password_file, self.root, server.server_port)
             self.assertTrue(probe(time.monotonic() + 2))
+            for change in ({"running": False}, {"lifecycle": "recovering"}, {"controller_ready": False}, {"tun": True}):
+                with self.subTest(change=change), mock.patch.dict(status, change):
+                    self.assertFalse(probe(time.monotonic() + 2))
+
         finally:
             server.shutdown()
             server.server_close()
             thread.join(timeout=1)
-        self.assertEqual(observed, [
+        self.assertEqual(observed[:3], [
             ("GET", "/api/proxy/capabilities", False),
             ("POST", "/api/auth/login", False),
             ("GET", "/api/proxy/status", True),
