@@ -96,7 +96,7 @@
       {"id": "managed-mihomo-controller-socket", "path": "/data/u60-pro-managed/mihomo/mihomo.sock", "kind": "socket", "classification": "mihomo_owned", "owner_id": "managed-mihomo"},
       {"id": "managed-mihomo-ui", "path": "/data/u60-pro-managed/mihomo/ui", "kind": "directory", "classification": "mihomo_owned", "owner_id": "managed-mihomo"},
       {"id": "managed-mihomo-log", "path": "/data/u60-pro-managed/mihomo/mihomo.log", "kind": "file", "classification": "mihomo_owned", "owner_id": "managed-mihomo"},
-      {"id": "managed-mihomo-owner-record", "path": "/data/u60-pro-managed/mihomo/mihomo.pid", "kind": "file", "classification": "mihomo_owned", "owner_id": "managed-mihomo", "format": "0600 JSON containing PID, start ticks, executable device/inode/SHA-256, exact argv paths, process owner token, schema and phase"},
+      {"id": "managed-mihomo-owner-record", "path": "/data/u60-pro-managed/mihomo/mihomo.pid", "kind": "file", "classification": "mihomo_owned", "owner_id": "managed-mihomo", "format": "0600 JSON containing boot ID, PID, start ticks, executable device/inode/SHA-256, exact argv paths, process owner token, schema and phase"},
       {"id": "managed-mihomo-manager-lock", "path": "/data/u60-pro-managed/mihomo/manager.lock", "kind": "file", "classification": "project_owned", "owner_id": "u60-proxy-agent"},
       {"id": "temporary-staging-dir", "path": "/data/u60-pro-managed/staging", "kind": "directory", "classification": "project_owned", "owner_id": "u60-proxy-managed", "temporary": true},
       {"id": "startup-transaction-dir", "path": "/data/u60-pro-managed/staging/startup-transaction", "kind": "directory", "classification": "project_owned", "owner_id": "u60-proxy-managed", "temporary": true},

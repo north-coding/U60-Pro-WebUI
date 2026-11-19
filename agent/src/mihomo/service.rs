@@ -505,6 +505,7 @@ pub fn log_tail_error() -> Option<String> {
 pub fn spawn() -> Result<Process, String> {
     ensure_proxy_only_runtime_dir()?;
     let binary = ownership::validate_binary(Path::new(BINARY))?;
+    let boot_id = ownership::read_boot_id(Path::new("/proc"))?;
     validate_optional_private_file(Path::new(LOG))?;
     let prior_log_identity = match fs::symlink_metadata(LOG) {
         Ok(metadata) => Some(FileIdentity::from_metadata(&metadata)),
@@ -542,6 +543,7 @@ pub fn spawn() -> Result<Process, String> {
         Path::new(DIR),
         Path::new(CONFIG),
         owner_token.clone(),
+        boot_id,
     );
     let mut owner_file = ownership::reserve_owner_file(Path::new(PIDFILE), &owner)?;
     let mut cmd = Command::new(BINARY);

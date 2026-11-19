@@ -88,7 +88,10 @@ boot. Binding 127.0.0.1:9090 alone does not prove that LAN 9090 is free.
 Managed start checks that the legacy executable is absent, the LAN controller
 port is free and the selected mixed port is available. Recovery checks for
 legacy process conflicts and keeps the existing durable owner record and pidfd
-verification. The loopback Agent and the private Mihomo controller socket
+verification. A Linux boot ID distinguishes records from previous boots.
+Such a record is removed only when the binary digest still matches and no
+current process claims the managed runtime. No PID from a previous boot is
+used for adoption or signalling. The loopback Agent and private controller socket
 serve different roles.
 
 First activation uses fresh managed state with TUN disabled. Start Mihomo

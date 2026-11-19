@@ -41,6 +41,8 @@ pub struct OwnerRecord {
     pub phase: Phase,
     pub pid: Option<u32>,
     pub start_ticks: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
     pub executable: String,
     pub executable_device: u64,
     pub executable_inode: u64,
@@ -198,15 +200,38 @@ fn verify_binary_unchanged(
     Ok(())
 }
 
+fn valid_boot_id(id: &str) -> bool {
+    id.len() == 36
+        && id.bytes().enumerate().all(|(index, value)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                value == b'-'
+            } else {
+                value.is_ascii_digit() || (b'a'..=b'f').contains(&value)
+            }
+        })
+}
+
+pub fn read_boot_id(proc_root: &Path) -> Result<String, String> {
+    let raw = fs::read_to_string(proc_root.join("sys/kernel/random/boot_id"))
+        .map_err(|error| format!("cannot read the Linux boot identity: {error}"))?;
+    let id = raw.trim_end_matches('\n');
+    if !valid_boot_id(id) {
+        return Err("Linux boot identity is malformed".into());
+    }
+    Ok(id.to_owned())
+}
+
 pub fn starting_record(
     executable: &Path,
     binary: &BinaryIdentity,
     runtime_dir: &Path,
     config: &Path,
     owner_token: String,
+    boot_id: String,
 ) -> OwnerRecord {
     OwnerRecord {
-        schema: 1,
+        schema: 2,
+        boot_id: Some(boot_id),
         phase: Phase::Starting,
         pid: None,
         start_ticks: None,
@@ -305,7 +330,12 @@ pub fn inspect_owner(
         };
     };
 
-    if record.schema != 1
+    let valid_schema = match (record.schema, record.boot_id.as_deref()) {
+        (1, None) => true,
+        (2, Some(id)) => valid_boot_id(id),
+        _ => false,
+    };
+    if !valid_schema
         || record.executable != executable.to_string_lossy()
         || record.runtime_dir != runtime_dir.to_string_lossy()
         || record.config != config.to_string_lossy()
@@ -323,6 +353,34 @@ pub fn inspect_owner(
         Ok(identity) => identity,
         Err(error) => return Inspection::Blocked(error),
     };
+    if let Some(record_boot_id) = record.boot_id.as_deref() {
+        let current_boot_id = match read_boot_id(proc_root) {
+            Ok(id) => id,
+            Err(error) => return Inspection::Blocked(error),
+        };
+        if record_boot_id != current_boot_id {
+            let complete_phase = match record.phase {
+                Phase::Starting => record.pid.is_none() && record.start_ticks.is_none(),
+                Phase::Running => {
+                    record.pid.is_some_and(|pid| pid > 0)
+                        && record.start_ticks.is_some_and(|ticks| ticks > 0)
+                }
+            };
+            if !complete_phase || binary.sha256 != record.executable_sha256 {
+                return Inspection::Blocked("previous-boot Mihomo owner record is invalid".into());
+            }
+            return match scan_runtime_claims(proc_root, executable, runtime_dir, config) {
+                Ok(found) if found.is_empty() => match remove_record(record_path, file_identity) {
+                    Ok(()) => Inspection::Stopped,
+                    Err(error) => Inspection::Blocked(error),
+                },
+                Ok(_) => Inspection::Blocked(
+                    "previous-boot Mihomo owner record conflicts with a live runtime claim".into(),
+                ),
+                Err(error) => Inspection::Blocked(error),
+            };
+        }
+    }
     if binary.device != record.executable_device
         || binary.inode != record.executable_inode
         || binary.sha256 != record.executable_sha256
@@ -531,8 +589,7 @@ pub fn matches_record(
 }
 
 /// Find every process that could be using the managed binary or claiming the
-/// managed runtime in argv. A matching binary with different argv (or the
-/// expected argv with a different executable) is a conflict, never ignored.
+/// managed runtime in argv. Either claim is sufficient to block absence.
 fn scan_runtime_claims(
     proc_root: &Path,
     executable: &Path,
@@ -541,13 +598,15 @@ fn scan_runtime_claims(
 ) -> Result<Vec<ProcessEvidence>, String> {
     let entries = fs::read_dir(proc_root)
         .map_err(|error| format!("cannot inspect process table: {error}"))?;
-    let expected_args = vec![
-        executable.to_string_lossy().into_owned(),
-        "-d".into(),
-        runtime_dir.to_string_lossy().into_owned(),
-        "-f".into(),
-        config.to_string_lossy().into_owned(),
-    ];
+    let identity = match fs::metadata(executable) {
+        Ok(metadata) => Some((metadata.dev(), metadata.ino())),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(format!("cannot inspect the managed executable: {error}")),
+    };
+    let mut deleted = executable.as_os_str().to_os_string();
+    deleted.push(" (deleted)");
+    let runtime_arg = runtime_dir.to_string_lossy();
+    let config_arg = config.to_string_lossy();
     let mut found = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|error| format!("cannot inspect process table: {error}"))?;
@@ -560,7 +619,14 @@ fn scan_runtime_claims(
         };
         match inspect_process(proc_root, pid) {
             Ok(process)
-                if process.executable == executable || process.command_line == expected_args =>
+                if process.executable == executable
+                    || process.executable == Path::new(&deleted)
+                    || identity == Some((process.executable_device, process.executable_inode))
+                    || process.command_line.iter().any(|arg| {
+                        arg == runtime_arg.as_ref() || arg == config_arg.as_ref()
+                            || arg.strip_prefix("-d=") == Some(runtime_arg.as_ref())
+                            || arg.strip_prefix("-f=") == Some(config_arg.as_ref())
+                    }) =>
             {
                 found.push(process)
             }
@@ -959,6 +1025,52 @@ mod tests {
         let _ = fs::remove_dir_all(root);
     }
 
+    #[test]
+    fn previous_boot_record_never_adopts_or_signals_reused_pid() {
+        let root = scratch("previous-boot");
+        let binary = root.join("mihomo");
+        let proc_root = root.join("proc");
+        let boot_id = proc_root.join("sys/kernel/random/boot_id");
+        fs::create_dir_all(boot_id.parent().unwrap()).unwrap();
+        fs::write(&boot_id, "fedcba98-7654-3210-fedc-ba9876543210\n").unwrap();
+        let runtime = Path::new("/data/u60-pro-managed/mihomo");
+        let config = Path::new("/data/u60-pro-managed/mihomo/config.yaml");
+        let record_path = root.join("mihomo.pid");
+        fake_binary(&binary, 183);
+        let identity = validate_binary(&binary).unwrap();
+        let mut record = super::starting_record(
+            &binary,
+            &identity,
+            runtime,
+            config,
+            "ab".repeat(32),
+            "01234567-89ab-cdef-0123-456789abcdef".into(),
+        );
+        record.phase = Phase::Running;
+        record.pid = Some(41);
+        record.start_ticks = Some(100);
+        create_record(&record_path, &record).unwrap();
+        let unrelated = root.join("unrelated");
+        fake_binary(&unrelated, 183);
+        proc_entry(&proc_root, 41, &unrelated, &"cd".repeat(32), 7);
+        // A different executable claiming the managed runtime still blocks.
+        let cmdline = proc_root.join("41/cmdline");
+        assert!(matches!(
+            inspect_owner(&record_path, &proc_root, &binary, runtime, config),
+            Inspection::Blocked(_)
+        ));
+        assert!(record_path.exists());
+        fs::write(&cmdline, b"unrelated\0").unwrap();
+        let unrelated_stat = fs::read(proc_root.join("41/stat")).unwrap();
+        assert!(matches!(
+            inspect_owner(&record_path, &proc_root, &binary, runtime, config),
+            Inspection::Stopped
+        ));
+        assert!(!record_path.exists());
+        assert_eq!(fs::read(proc_root.join("41/stat")).unwrap(), unrelated_stat);
+        fs::remove_dir_all(root).unwrap();
+    }
+
     fn starting_record(
         binary_path: &Path,
         identity: &BinaryIdentity,
@@ -966,6 +1078,7 @@ mod tests {
     ) -> OwnerRecord {
         OwnerRecord {
             schema: 1,
+            boot_id: None,
             phase: Phase::Starting,
             pid: None,
             start_ticks: None,
