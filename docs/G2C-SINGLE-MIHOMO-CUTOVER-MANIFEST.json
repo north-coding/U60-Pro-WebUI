@@ -124,12 +124,16 @@
     "execution_mode": "marked_temporary_synthetic_root_only",
     "device_execution_enabled": false,
     "target": "/etc/rc.local",
+    "observed_old_entry_line": 43,
+    "required_current_identity": "trusted inventory must match the full startup SHA-256 and file metadata; reported line number is informational",
+    "legacy_process_gate": "rediscover independently; verify executable hash/device/inode, PID start identity and service ownership; use a verified pidfd for any separately authorized stop; confirm absence and release of LAN 7890 and 9090",
+    "retention": "retain all /data/mihomo files until functional acceptance and separate cleanup authorization",
     "snapshot_path": "/data/u60-pro-managed/staging/startup-transaction/original.rc.local",
     "snapshot_mode": "0400",
     "snapshot_integrity": "sha256 plus original owner, group, mode, device and inode metadata",
-    "candidate_entry": "sh /data/u60-pro-managed/agent/start-proxy-agent.sh start",
-    "replace_policy": "replace only one exact unchanged project-owned old Agent entry; preserve all other bytes",
-    "health_check": {"scope": "marked_temporary_synthetic_root_only", "auth": "synthetic loopback capability discovery, test-password login, bearer-authenticated proxy status", "total_timeout_seconds": 8, "per_request_timeout_seconds": 1, "attempts": 8, "device_gate": "verify listener executable and process identity before any production credential is sent; no device health adapter is implemented"},
+    "candidate_entry": "sh /data/u60-pro-managed/agent/start-proxy-agent.sh start &",
+    "replace_policy": "replace only one exact unchanged project-owned old Mihomo entry; preserve all other bytes",
+    "health_check": {"scope": "marked_temporary_synthetic_root_only", "auth": "synthetic loopback capability discovery, test-password login, bearer-authenticated status with running managed Mihomo, responsive controller, Rule/bypass_cn and TUN disabled", "total_timeout_seconds": 8, "per_request_timeout_seconds": 1, "attempts": 8, "device_gate": "verify listener executable and process identity before any production credential is sent; no device health adapter is implemented"},
     "rollback_policy": "remove only the exact new proxy-only startup entry; retain the original snapshot; never restore the abandoned legacy startup entry",
     "process_and_network_cleanup": "none; do not stop unverified processes or delete routes, firewall rules, interfaces, or legacy Mihomo files"
   },
@@ -144,28 +148,12 @@
   ],
   "candidate_cleanup_targets": [
     {
-      "id": "legacy-agent-binary",
-      "path": "/data/zte-agent",
-      "kind": "file",
-      "classification": "project_owned",
-      "owner_id": "u60-project-agent",
-      "action": "replace_after_verified_staging"
-    },
-    {
-      "id": "legacy-agent-startup",
-      "path": "/data/local/tmp/start_zte_agent.sh",
-      "kind": "file",
-      "classification": "project_owned",
-      "owner_id": "u60-project-agent",
-      "action": "replace_after_verified_staging"
-    },
-    {
       "id": "legacy-mihomo-binary",
       "path": "/data/mihomo/mihomo",
       "kind": "file",
       "classification": "mihomo_owned",
       "owner_id": "legacy-mihomo",
-      "action": "remove_exact_file_after_cutover"
+      "action": "remove_exact_file_after_acceptance_and_separate_authorization"
     },
     {
       "id": "legacy-mihomo-config",
@@ -173,7 +161,7 @@
       "kind": "file",
       "classification": "mihomo_owned",
       "owner_id": "legacy-mihomo",
-      "action": "remove_exact_file_after_cutover"
+      "action": "remove_exact_file_after_acceptance_and_separate_authorization"
     },
     {
       "id": "legacy-mihomo-manager-state",
@@ -181,7 +169,7 @@
       "kind": "file",
       "classification": "mihomo_owned",
       "owner_id": "legacy-mihomo",
-      "action": "remove_exact_file_after_cutover"
+      "action": "remove_exact_file_after_acceptance_and_separate_authorization"
     },
     {
       "id": "legacy-mihomo-cn-list",
@@ -189,7 +177,7 @@
       "kind": "file",
       "classification": "mihomo_owned",
       "owner_id": "legacy-mihomo",
-      "action": "remove_exact_file_after_cutover"
+      "action": "remove_exact_file_after_acceptance_and_separate_authorization"
     },
     {
       "id": "legacy-mihomo-provider-cache",
@@ -197,7 +185,7 @@
       "kind": "directory",
       "classification": "mihomo_owned",
       "owner_id": "legacy-mihomo",
-      "action": "remove_only_after_complete_child_inventory"
+      "action": "remove_only_after_acceptance_separate_authorization_and_complete_child_inventory"
     },
     {
       "id": "legacy-mihomo-profile-cache",
@@ -205,7 +193,7 @@
       "kind": "directory",
       "classification": "mihomo_owned",
       "owner_id": "legacy-mihomo",
-      "action": "remove_only_after_complete_child_inventory"
+      "action": "remove_only_after_acceptance_separate_authorization_and_complete_child_inventory"
     },
     {
       "id": "legacy-mihomo-panel",
@@ -213,7 +201,7 @@
       "kind": "directory",
       "classification": "mihomo_owned",
       "owner_id": "legacy-mihomo",
-      "action": "remove_only_after_complete_child_inventory"
+      "action": "remove_only_after_acceptance_separate_authorization_and_complete_child_inventory"
     },
     {
       "id": "legacy-mihomo-pid",
@@ -221,7 +209,7 @@
       "kind": "file",
       "classification": "mihomo_owned",
       "owner_id": "legacy-mihomo",
-      "action": "remove_exact_file_after_process_stop"
+      "action": "remove_exact_file_after_acceptance_separate_authorization_and_process_stop"
     },
     {
       "id": "legacy-mihomo-log",
@@ -229,21 +217,20 @@
       "kind": "file",
       "classification": "mihomo_owned",
       "owner_id": "legacy-mihomo",
-      "action": "remove_exact_file_after_process_stop"
+      "action": "remove_exact_file_after_acceptance_separate_authorization_and_process_stop"
     },
     {
-      "id": "legacy-agent-rc-local-entry",
+      "id": "legacy-mihomo-rc-local-entry",
       "path": "/etc/rc.local",
       "kind": "startup_entry",
       "classification": "project_owned",
-      "owner_id": "u60-project-agent",
-      "exact_entry": "sh /data/local/tmp/start_zte_agent.sh",
-      "replacement_entry": "sh /data/u60-pro-managed/agent/start-proxy-agent.sh start",
+      "owner_id": "legacy-mihomo",
+      "exact_entry": "sh /data/mihomo/start-mihomo.sh >/data/mihomo/autostart.log 2>&1 &",
+      "replacement_entry": "sh /data/u60-pro-managed/agent/start-proxy-agent.sh start &",
       "action": "replace_exact_entry_only"
     }
   ],
   "managed_services": [
-    {"name": "zte-agent", "owner_id": "u60-project-agent"},
     {"name": "legacy-mihomo", "owner_id": "legacy-mihomo"},
     {"name": "proxy-only-agent", "owner_id": "u60-proxy-agent"},
     {"name": "managed-mihomo", "owner_id": "managed-mihomo"}
@@ -263,7 +250,7 @@
   "rollback_scope": {
     "preserve": ["the complete pre-change rc.local snapshot and its digest/identity metadata", "all unrelated rc.local bytes", "existing auth inputs without exposing them", "stock router services"],
     "exclude": ["old Mihomo configuration", "old subscriptions and provider cache", "stock firmware, SSH keys, USB assets, and cellular/Wi-Fi configuration"],
-    "fallback": "remove only the exact new proxy-only startup entry and retain the verified original snapshot; do not start the abandoned legacy Agent or Mihomo, stop unverified processes, or change network resources"
+    "fallback": "remove only the exact new proxy-only startup entry and retain the verified original snapshot; do not start the abandoned legacy Mihomo, stop unverified processes, or change network resources"
   },
   "offline_preparation_checks": [
     "artifact_hashes_verified",
@@ -286,6 +273,7 @@
     "authenticated_proxy_management_only_startup",
     "proxy_api_authentication_verified",
     "mihomo_controller_health_verified",
+    "managed_mihomo_restart_and_reboot_verified",
     "manual_subscription_refresh_verified",
     "rule_mode_cn_direct_foreign_proxy_verified",
     "wifi_client_data_plane_verified",
@@ -325,7 +313,7 @@
     {
       "id": "startup-activation-contract",
       "files": ["agent/src/proxy_only.rs", "scripts/device/start-proxy-agent.sh", "scripts/device/prepare-proxy-rc-local.py", "scripts/device/startup_transaction.py"],
-      "requirement": "For offline verification, require a protected complete snapshot, exact project-owned entry, shell syntax, verified artifact hashes/architectures/paths, and bounded authenticated health before changing a marked synthetic rc.local. Roll back by removing only the new entry; preserve stock bytes and never restore the abandoned legacy entry. Device execution remains disabled.",
+      "requirement": "Before replacement validate current startup identity, snapshot, syntax and staged artifacts. After replacement require bounded authenticated managed Mihomo readiness. On failure disable only the new entry and retain the original snapshot. Execution is limited to a marked synthetic tree.",
       "status": "implemented_and_tested_synthetic_only_device_execution_disabled"
     },
     {
@@ -336,7 +324,7 @@
     }
   ],
   "failure_recovery_conditions": [
-    "Keep a complete mode-0400 original rc.local snapshot and remove only the exact new proxy-only entry on rollback; never restore the abandoned legacy Agent entry.",
+    "Keep a complete mode-0400 original rc.local snapshot and remove only the exact new proxy-only entry on rollback; never restore the abandoned legacy Mihomo entry.",
     "Do not stop processes as part of the startup-file transaction; process cleanup requires separately verified ownership and approval.",
     "Leave Mihomo-owned resources untouched when process or path ownership is unknown.",
     "Do not remove a live process, route, firewall rule, SSH component, USB asset, or stock service during recovery.",

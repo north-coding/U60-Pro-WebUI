@@ -229,18 +229,18 @@ else:
 
 class ProxyStartupEntryTests(unittest.TestCase):
     def test_transform_preserves_unrelated_bytes_and_rollback_removes_only_project_entry(self):
-        original = b"#!/bin/sh\r\n# stock bytes\r\necho stock\r\nsh /data/local/tmp/start_zte_agent.sh\r\necho after\r\n"
+        original = b"#!/bin/sh\r\n# stock bytes\r\necho stock\r\nsh /data/mihomo/start-mihomo.sh >/data/mihomo/autostart.log 2>&1 &\r\necho after\r\n"
         candidate, rollback = startup_transaction.transform_startup(original)
-        self.assertEqual(candidate, original.replace(b"sh /data/local/tmp/start_zte_agent.sh\r\n", b"sh /data/u60-pro-managed/agent/start-proxy-agent.sh start\r\n"))
+        self.assertEqual(candidate, original.replace(b"sh /data/mihomo/start-mihomo.sh >/data/mihomo/autostart.log 2>&1 &\r\n", b"sh /data/u60-pro-managed/agent/start-proxy-agent.sh start &\r\n"))
         self.assertEqual(rollback, b"#!/bin/sh\r\n# stock bytes\r\necho stock\r\necho after\r\n")
 
     def test_transform_rejects_missing_duplicate_modified_and_candidate_entries(self):
         for content in (
             b"#!/bin/sh\necho stock\n",
-            b"sh /data/local/tmp/start_zte_agent.sh\nsh /data/local/tmp/start_zte_agent.sh\n",
-            b"sh /data/local/tmp/start_zte_agent.sh extra\n",
-            b"sh /data/local/tmp/start_zte_agent.sh \r\n",
-            b"sh /data/u60-pro-managed/agent/start-proxy-agent.sh start\n",
+            b"sh /data/mihomo/start-mihomo.sh >/data/mihomo/autostart.log 2>&1 &\nsh /data/mihomo/start-mihomo.sh >/data/mihomo/autostart.log 2>&1 &\n",
+            b"sh /data/mihomo/start-mihomo.sh >/data/mihomo/autostart.log 2>&1 & extra\n",
+            b"sh /data/mihomo/start-mihomo.sh >/data/mihomo/autostart.log 2>&1 & \r\n",
+            b"sh /data/u60-pro-managed/agent/start-proxy-agent.sh start &\n",
         ):
             with self.subTest(content=content), self.assertRaises(startup_transaction.TransactionError):
                 startup_transaction.transform_startup(content)

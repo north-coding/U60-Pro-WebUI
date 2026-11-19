@@ -25,8 +25,8 @@ from typing import Callable
 from proxy_credentials import read_password_file, validate_synthetic_test_root
 
 
-OLD_ENTRY = b"sh /data/local/tmp/start_zte_agent.sh"
-NEW_ENTRY = b"sh /data/u60-pro-managed/agent/start-proxy-agent.sh start"
+OLD_ENTRY = b"sh /data/mihomo/start-mihomo.sh >/data/mihomo/autostart.log 2>&1 &"
+NEW_ENTRY = b"sh /data/u60-pro-managed/agent/start-proxy-agent.sh start &"
 TEST_ROOT_MARKER = ".u60-proxy-transaction-test-root"
 DEVICE_RC_LOCAL = "/etc/rc.local"
 MANAGED_ROOT = "data/u60-pro-managed"
@@ -180,21 +180,44 @@ def _entry_ending(line: bytes, entry: bytes) -> bytes | None:
 def transform_startup(content: bytes) -> tuple[bytes, bytes]:
     """Return candidate and fail-closed rollback bytes, changing only OLD_ENTRY."""
     lines = _entry_lines(content)
-    owned_markers = (b"start_zte_agent.sh", b"start-proxy-agent.sh")
+    owned_markers = (b"/data/mihomo", b"start-mihomo.sh", b"start_zte_agent.sh", b"start-proxy-agent.sh")
     mentions = [line for line in lines if any(marker in line for marker in owned_markers)]
     old = [index for index, line in enumerate(lines) if _entry_ending(line, OLD_ENTRY) is not None]
     if len(old) != 1 or len(mentions) != 1 or _entry_ending(mentions[0], OLD_ENTRY) is None:
-        raise TransactionError("expected exactly one unchanged project-owned Agent startup entry")
+        raise TransactionError("expected exactly one unchanged project-owned Mihomo startup entry")
     index = old[0]
     ending = _entry_ending(lines[index], OLD_ENTRY)
     assert ending is not None
     candidate_lines = list(lines)
     candidate_lines[index] = NEW_ENTRY + ending
     rollback_lines = list(lines)
-    rollback_lines.pop(index)  # Preserve the original snapshot; never reboot into the abandoned Agent.
+    rollback_lines.pop(index)  # Preserve the original snapshot; leave the obsolete Mihomo disabled.
     candidate = b"".join(candidate_lines)
     rollback = b"".join(rollback_lines)
     return candidate, rollback
+
+
+def startup_identity(content: bytes, metadata: os.stat_result) -> dict:
+    return {
+        "sha256": sha256_bytes(content),
+        "device": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "mode": metadata.st_mode,
+        "uid": metadata.st_uid,
+        "gid": metadata.st_gid,
+        "links": metadata.st_nlink,
+        "size": metadata.st_size,
+        "mtime_ns": metadata.st_mtime_ns,
+        "ctime_ns": metadata.st_ctime_ns,
+    }
+
+
+def validate_startup_files(original: bytes, candidate: bytes, rollback: bytes) -> None:
+    for label, content in (("original", original), ("candidate", candidate), ("rollback", rollback)):
+        if b"\0" in content or subprocess.run(
+            ["/bin/sh", "-n"], input=content, capture_output=True, timeout=2
+        ).returncode:
+            raise TransactionError(f"{label} startup file failed shell syntax validation")
 
 
 def _verify_artifact(root: Path, relative: str, uid: int, arch: str | None) -> str:
@@ -241,15 +264,19 @@ class StartupTransaction:
         self.transaction = self.staging / "startup-transaction"
         self.lock_path = self.staging / "startup-transaction.lock"
 
-    def _validate_layout(self) -> None:
+    def _validate_transaction_paths(self) -> None:
         _check_directory(self.root, self.uid, 0o700)
         _check_directory(self.root / "etc", self.uid, 0o700)
         _check_directory(self.root / "data", self.uid, 0o700)
         _check_directory(self.managed, self.uid, 0o700)
-        for path in (self.agent, self.mihomo, self.auth, self.staging):
+        _check_directory(self.staging, self.uid, 0o700)
+        _regular_file(self.rc, self.uid)
+
+    def _validate_layout(self) -> None:
+        self._validate_transaction_paths()
+        for path in (self.agent, self.mihomo, self.auth):
             _check_directory(path, self.uid, 0o700)
         read_password_file(self.auth / "password", self.uid)
-        _regular_file(self.rc, self.uid)
         self._validate_artifacts()
 
     def _validate_artifacts(self) -> None:
@@ -378,9 +405,9 @@ class StartupTransaction:
     def _stage_name(self) -> str:
         return ".u60-rc-" + secrets.token_hex(12)
 
-    def _replace(self, expected: bytes, replacement: bytes, state: dict, *, rollback: bool = False) -> None:
+    def _replace(self, expected: bytes, replacement: bytes, state: dict, *, rollback: bool = False, original_identity: dict | None = None) -> None:
         current, current_meta = _read_checked(self.rc, self.uid, max_size=MAX_RC_BYTES)
-        if current != expected:
+        if current != expected or (original_identity is not None and startup_identity(current, current_meta) != original_identity):
             raise TransactionError("startup file no longer matches the transaction's expected bytes")
         name_key = "rollback_stage_name" if rollback else "stage_name"
         device_key = "rollback_device" if rollback else "candidate_device"
@@ -420,9 +447,7 @@ class StartupTransaction:
         current_again, current_meta_again = _read_checked(self.rc, self.uid, max_size=MAX_RC_BYTES)
         if (
             current_again != expected
-            or (current_meta_again.st_dev, current_meta_again.st_ino) != (current_meta.st_dev, current_meta.st_ino)
-            or current_meta_again.st_gid != current_meta.st_gid
-            or stat.S_IMODE(current_meta_again.st_mode) != stat.S_IMODE(current_meta.st_mode)
+            or _file_signature(current_meta_again) != _file_signature(current_meta)
         ):
             self._cleanup_one_stage(stage)
             raise TransactionError("startup file changed during atomic replacement")
@@ -506,18 +531,37 @@ class StartupTransaction:
         ):
             raise TransactionError("candidate startup identity changed; refusing rollback overwrite")
         # Roll back by removing only the new proxy entry. The protected snapshot
-        # retains the original file, but the abandoned legacy Agent is never
+        # retains the original file, but the obsolete Mihomo is never
         # restored into the boot path.
         self._replace(current, expected_rollback, state, rollback=True)
         self._cleanup_recorded_stage(state, "rollback_stage_name", "rollback_device", "rollback_inode")
         state["phase"] = "rolled_back"
         self._write_state(state)
 
+    def _validated_startup(self, expected_identity: dict) -> tuple[bytes, os.stat_result, bytes, bytes]:
+        original, metadata = _read_checked(self.rc, self.uid)
+        observed = startup_identity(original, metadata)
+        if (
+            not isinstance(expected_identity, dict)
+            or expected_identity.keys() != observed.keys()
+            or any(type(expected_identity[key]) is not type(value) or expected_identity[key] != value
+                   for key, value in observed.items())
+        ):
+            raise TransactionError("startup identity or complete content differs from the verified inventory")
+        candidate, rollback = transform_startup(original)
+        validate_startup_files(original, candidate, rollback)
+        return original, metadata, candidate, rollback
+
+    def dry_run(self, expected_identity: dict) -> None:
+        self._validate_layout()
+        self._validated_startup(expected_identity)
+
     def activate(
         self,
         launch: Callable[[], None],
         health_probe: Callable[[float], bool],
         *,
+        expected_identity: dict,
         total_timeout: float = HEALTH_TIMEOUT_SECONDS,
         request_timeout: float = HEALTH_REQUEST_TIMEOUT_SECONDS,
         attempts: int = HEALTH_ATTEMPTS,
@@ -527,17 +571,13 @@ class StartupTransaction:
         self._validate_layout()
         lock_fd = self._lock()
         try:
-            original, metadata = _read_checked(self.rc, self.uid, max_size=MAX_RC_BYTES)
-            candidate, rollback = transform_startup(original)
-            syntax = subprocess.run(["sh", "-n"], input=original, check=False, capture_output=True, timeout=2)
-            if syntax.returncode:
-                raise TransactionError("original startup file failed shell syntax validation")
+            original, metadata, candidate, rollback = self._validated_startup(expected_identity)
             stage_name = self._stage_name()
             state = self._create_snapshot(original, metadata, candidate, rollback, stage_name)
             try:
                 if failpoint:
                     failpoint("after-snapshot")
-                self._replace(original, candidate, state)
+                self._replace(original, candidate, state, original_identity=expected_identity)
                 if failpoint:
                     failpoint("after-replacement")
                 launch()
@@ -575,7 +615,7 @@ class StartupTransaction:
             os.close(lock_fd)
 
     def recover_pending(self) -> str:
-        self._validate_layout()
+        self._validate_transaction_paths()
         lock_fd = self._lock()
         try:
             original, _, state = self._read_snapshot()
@@ -765,9 +805,16 @@ class SyntheticLocalAgentHealthProbe:
                 return False
             status = self._request("GET", "/api/proxy/status", None, token, deadline)
             return (
-                isinstance(status.get("running"), bool)
-                and status.get("mode") in {"rule", "global", "direct"}
-                and isinstance(status.get("enabled"), bool)
+                status.get("running") is True
+                and status.get("enabled") is True
+                and status.get("lifecycle") == "running"
+                and status.get("controller_ready") is True
+                and status.get("mode") == "rule"
+                and status.get("preset") == "bypass_cn"
+                and "profile" in status
+                and status["profile"] is None
+                and status.get("tun") is False
+                and status.get("tun_active") is False
             )
         except Exception:
             # Do not include request bodies, credentials, tokens, or raw Agent errors.
