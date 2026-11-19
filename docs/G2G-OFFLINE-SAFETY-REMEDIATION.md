@@ -80,12 +80,16 @@ command. Rediscover the legacy listener owners and match the executable path,
 device/inode, digest, start ticks and launch ownership. Any controlled stop
 needs a verified pidfd tied to the same process identity and a post-stop
 recheck that the process is gone and LAN 7890/9090 are free. Unverified
-ownership blocks cutover. Retain old files until a separate post-acceptance
+ownership blocks cutover. The runtime gate checks the known install and visible
+process evidence. It cannot establish that a relocated or retagged binary
+with unrelated arguments and no listeners has exited. The current-process
+verification at cutover remains required. Retain old files until a separate post-acceptance
 cleanup decision.
 
 The launcher uses explicit proxy-only mode and starts in the background on
 boot. Binding 127.0.0.1:9090 alone does not prove that LAN 9090 is free.
-Managed start checks that the legacy executable is absent, the LAN controller
+Managed start checks that the known legacy executable and launcher/runtime
+arguments are absent, the LAN controller
 port is free and the selected mixed port is available. Recovery checks for
 legacy process conflicts and keeps the existing durable owner record and pidfd
 verification. A Linux boot ID distinguishes records from previous boots.

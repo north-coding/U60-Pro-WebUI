@@ -10,6 +10,7 @@ use std::io::Read;
 #[cfg(target_os = "linux")]
 use std::os::fd::FromRawFd;
 use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, FileTypeExt, MetadataExt, OpenOptionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -201,6 +202,11 @@ fn check_legacy_mihomo_absent(proc_root: &Path, legacy_binary: &Path) -> Result<
             ))
         }
     };
+    let legacy_dir = legacy_binary
+        .parent()
+        .ok_or("legacy Mihomo executable has no parent")?;
+    let launcher = legacy_dir.join("start-mihomo.sh");
+    let config = legacy_dir.join("config.yaml");
     let deleted_name = format!("{} (deleted)", legacy_binary.display());
     let scan_error = |error| format!("cannot check for legacy Mihomo in procfs: {error}");
     for entry in fs::read_dir(proc_root).map_err(scan_error)? {
@@ -234,6 +240,33 @@ fn check_legacy_mihomo_absent(proc_root: &Path, legacy_binary: &Path) -> Result<
                 Err(error) if disappeared(&error) => {}
                 Err(error) => return Err(scan_error(error)),
             }
+        }
+        let cmdline = match fs::read(entry.path().join("cmdline")) {
+            Ok(cmdline) => cmdline,
+            Err(error) if disappeared(&error) => continue,
+            Err(error) => return Err(scan_error(error)),
+        };
+        let mut args = cmdline.split(|byte| *byte == 0);
+        let first = args.next().unwrap_or_default();
+        let legacy_launcher = launcher.as_os_str().as_bytes();
+        if first == legacy_binary.as_os_str().as_bytes() || first == legacy_launcher {
+            return Err(
+                "legacy Mihomo startup or process is still present; cutover is blocked".into(),
+            );
+        }
+        let mut previous = first;
+        for arg in args {
+            if arg == legacy_launcher
+                || (previous == b"-d" && arg == legacy_dir.as_os_str().as_bytes())
+                || (previous == b"-f" && arg == config.as_os_str().as_bytes())
+                || arg.strip_prefix(b"-d=") == Some(legacy_dir.as_os_str().as_bytes())
+                || arg.strip_prefix(b"-f=") == Some(config.as_os_str().as_bytes())
+            {
+                return Err(
+                    "a process claims the legacy Mihomo runtime; cutover is blocked".into(),
+                );
+            }
+            previous = arg;
         }
     }
     Ok(())
@@ -1379,6 +1412,11 @@ mod tests {
         std::os::unix::fs::symlink(&legacy, &exe).unwrap();
         assert!(check_legacy_mihomo_absent(&proc_root, &legacy).is_err());
         fs::remove_file(&exe).unwrap();
+        std::os::unix::fs::symlink(&alias, &exe).unwrap();
+        let cmdline = proc_pid.join("cmdline");
+        fs::write(&cmdline, [legacy.as_os_str().as_bytes(), b"\0"].concat()).unwrap();
+        assert!(check_legacy_mihomo_absent(&proc_root, &legacy).is_err());
+        fs::write(&cmdline, b"unrelated\0").unwrap();
         assert!(check_legacy_mihomo_absent(&proc_root, &legacy).is_ok());
         fs::remove_dir_all(root).unwrap();
     }
